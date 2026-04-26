@@ -12,6 +12,9 @@ import {
   Package,
   Play,
   Loader2,
+  Library,
+  AlertCircle,
+  X,
 } from 'lucide-react';
 import {
   getTrackedVersions,
@@ -51,7 +54,11 @@ const KNOWN_PACKAGES = Object.entries(PACKAGE_GROUPS).map(([id, { name }]) => ({
   name,
 }));
 
-export function VersionTracker() {
+interface VersionTrackerProps {
+  onNavigateToLibrary?: () => void;
+}
+
+export function VersionTracker({ onNavigateToLibrary }: VersionTrackerProps) {
   const [selectedPackage, setSelectedPackage] = useState('com.whatsapp');
   const [channelFilter, setChannelFilter] = useState<'all' | 'stable' | 'beta'>('all');
   const [showAddModal, setShowAddModal] = useState(false);
@@ -120,6 +127,7 @@ export function VersionTracker() {
 
   const [downloadingVersions, setDownloadingVersions] = useState<Set<string>>(new Set());
   const [downloadMessages, setDownloadMessages] = useState<Map<string, string>>(new Map());
+  const [errorMessages, setErrorMessages] = useState<string[]>([]);
 
   const downloadMutation = useMutation({
     mutationFn: async ({ pkg, version }: { pkg: string; version: string }) => {
@@ -146,7 +154,9 @@ export function VersionTracker() {
         setDownloadMessages((prev) => new Map(prev).set(`${pkg}-${version}`, 'Downloaded!'));
         queryClient.invalidateQueries({ queryKey: ['versions'] });
       } else {
-        setDownloadMessages((prev) => new Map(prev).set(`${pkg}-${version}`, `Failed: ${status.message}`));
+        const errorMsg = `Download failed for ${pkg} ${version}: ${status.message || 'Unknown error'}`;
+        setErrorMessages((prev) => [...prev.slice(-4), errorMsg]); // Keep last 5 errors
+        setDownloadMessages((prev) => new Map(prev).set(`${pkg}-${version}`, 'Failed'));
       }
       // Clear message after 5 seconds
       setTimeout(() => {
@@ -163,7 +173,9 @@ export function VersionTracker() {
         next.delete(`${pkg}-${version}`);
         return next;
       });
-      setDownloadMessages((prev) => new Map(prev).set(`${pkg}-${version}`, `Error: ${error}`));
+      const errorMsg = `Download error for ${pkg} ${version}: ${String(error)}`;
+      setErrorMessages((prev) => [...prev.slice(-4), errorMsg]);
+      setDownloadMessages((prev) => new Map(prev).set(`${pkg}-${version}`, 'Error'));
     },
   });
 
@@ -300,6 +312,27 @@ export function VersionTracker() {
         </div>
       )}
 
+      {/* Error Messages */}
+      {errorMessages.length > 0 && (
+        <div className="space-y-2">
+          {errorMessages.map((msg, idx) => (
+            <div
+              key={idx}
+              className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 flex items-start gap-3"
+            >
+              <AlertCircle className="text-red-500 shrink-0 mt-0.5" size={18} />
+              <span className="text-red-400 text-sm flex-1">{msg}</span>
+              <button
+                onClick={() => setErrorMessages((prev) => prev.filter((_, i) => i !== idx))}
+                className="text-red-400 hover:text-red-300"
+              >
+                <X size={16} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Versions Table */}
       <div className="card p-0 overflow-hidden">
         {isLoading ? (
@@ -353,13 +386,21 @@ export function VersionTracker() {
                     </td>
                     <td className="table-cell">
                       {v.analyzed_at ? (
-                        <span className="badge-success flex items-center gap-1 w-fit">
+                        <button
+                          onClick={onNavigateToLibrary}
+                          className="badge-success flex items-center gap-1 w-fit hover:opacity-80 transition-opacity cursor-pointer"
+                          title="View in APK Library"
+                        >
                           <CheckCircle size={12} /> Analyzed
-                        </span>
+                        </button>
                       ) : v.downloaded_at ? (
-                        <span className="badge-warning flex items-center gap-1 w-fit">
-                          <Download size={12} /> Downloaded
-                        </span>
+                        <button
+                          onClick={onNavigateToLibrary}
+                          className="badge-warning flex items-center gap-1 w-fit hover:opacity-80 transition-opacity cursor-pointer"
+                          title="View in APK Library"
+                        >
+                          <Library size={12} /> Downloaded
+                        </button>
                       ) : (
                         <span className="text-slate-500 text-sm">Not downloaded</span>
                       )}

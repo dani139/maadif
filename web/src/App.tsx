@@ -29,7 +29,7 @@ function App() {
       case 'dashboard':
         return <Dashboard />;
       case 'versions':
-        return <VersionTracker />;
+        return <VersionTracker onNavigateToLibrary={() => setCurrentView('apks')} />;
       case 'apks':
         return <ApkLibrary />;
       case 'analysis':
