@@ -1,0 +1,64 @@
+# =============================================================================
+# MAADIF - Docker Compose Configuration
+# =============================================================================
+#
+# Usage:
+#   docker compose up --build      # Build and start API server
+#   docker compose up -d           # Start in background
+#   docker compose logs -f         # View logs
+#   docker compose down            # Stop
+#
+# API will be available at: http://localhost:8080
+#
+# =============================================================================
+
+services:
+  maadif:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      # Mount APKs directory - place your APKs here
+      - ./apks:/workspace/apks
+
+      # Mount output directory - analysis results stored here
+      - ./output:/workspace/output
+
+    environment:
+      - MAADIF_PORT=8080
+      - MAADIF_APKS_DIR=/workspace/apks
+      - MAADIF_OUTPUT_DIR=/workspace/output
+
+    # Ensure container has enough memory for Ghidra/JADX
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Optional: Interactive shell for debugging
+  maadif-shell:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - debug
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./apks:/workspace/apks
+      - ./output:/workspace/output

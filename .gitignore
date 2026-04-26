@@ -1,0 +1,68 @@
+# External cloned repositories
+external/
+
+# Build outputs
+target/
+build/
+out/
+*.class
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+.project
+.classpath
+.settings/
+
+# Gradle
+.gradle/
+gradle/
+
+# Maven
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+ENV/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# APK files (large binaries)
+*.apk
+apks/
+
+# Binary files
+*.so
+*.dex
+*.bin
+*.o
+*.a
+
+# Analysis outputs (large generated files)
+output/ghidra/
+output/ghidriff/
+output/jadx/
+output/jadx_test/
+
+# Keep output README
+!output/README.md
+
+# Temp files
+*.tmp
+*.temp
+*.bak
+
+# Ghidriff submodule/clone
+ghidriff
