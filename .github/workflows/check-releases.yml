@@ -1,0 +1,96 @@
+name: Check WhatsApp Releases
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  check-releases:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: scripts/.whatsapp_versions.json
+          key: whatsapp-versions-${{ github.run_id }}
+          restore-keys: |
+            whatsapp-versions-
+
+      - name: Check for new releases
+        id: check
+        run: |
+          cd scripts
+          python track_releases.py --check --json > result.json
+          cat result.json
+
+          # Set outputs
+          NEW_COUNT=$(jq '.count' result.json)
+          echo "new_count=$NEW_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$NEW_COUNT" -gt 0 ]; then
+            echo "has_new=true" >> $GITHUB_OUTPUT
+            VERSIONS=$(jq -r '.new_releases[] | "\(.channel): \(.version)"' result.json | tr '\n' ', ')
+            echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
+          else
+            echo "has_new=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create issue for new releases
+        if: steps.check.outputs.has_new == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const newCount = ${{ steps.check.outputs.new_count }};
+            const versions = "${{ steps.check.outputs.versions }}";
+
+            // Read the full result
+            const fs = require('fs');
+            const result = JSON.parse(fs.readFileSync('scripts/result.json', 'utf8'));
+
+            let body = `## New WhatsApp Release(s) Detected\n\n`;
+            body += `**Found ${newCount} new version(s)**\n\n`;
+
+            for (const release of result.new_releases) {
+              const badge = release.is_beta ? '🔶 BETA' : '🟢 STABLE';
+              body += `- ${badge} **${release.version}** (${release.arch})\n`;
+              body += `  - URL: ${release.url}\n`;
+            }
+
+            body += `\n---\n`;
+            body += `*Detected at: ${new Date().toISOString()}*`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🆕 New WhatsApp Release: ${versions.slice(0, 50)}`,
+              body: body,
+              labels: ['release', 'automated']
+            });
+
+      # Optional: Send webhook notification
+      # - name: Send webhook
+      #   if: steps.check.outputs.has_new == 'true'
+      #   run: |
+      #     curl -X POST "${{ secrets.WEBHOOK_URL }}" \
+      #       -H "Content-Type: application/json" \
+      #       -d @scripts/result.json
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: scripts/.whatsapp_versions.json
+          key: whatsapp-versions-${{ github.run_id }}
