@@ -1,6 +1,6 @@
 package io.maadif.analyzer;
 
-import ghidra.GhidraJarApplicationLayout;
+import ghidra.GhidraApplicationLayout;
 import ghidra.base.project.GhidraProject;
 import ghidra.framework.Application;
 import ghidra.framework.ApplicationConfiguration;
@@ -18,7 +18,7 @@ import java.io.PrintWriter;
 import java.util.*;
 
 /**
- * Ghidra-based binary analyzer for DEX files extracted from APKs.
+ * Ghidra-based binary analyzer for DEX files and native libraries.
  * Uses Ghidra's headless API to perform deep binary analysis.
  */
 public class GhidraAnalyzer {
@@ -27,58 +27,89 @@ public class GhidraAnalyzer {
     private File outputDir;
     private boolean initialized = false;
 
+    // Ghidra installation directory - set via environment or default
+    private static final String GHIDRA_HOME = System.getenv("GHIDRA_INSTALL_DIR") != null
+        ? System.getenv("GHIDRA_INSTALL_DIR")
+        : "/opt/ghidra";
+
     public GhidraAnalyzer(File outputDir) {
         this.outputDir = outputDir;
         this.projectDir = new File(outputDir, "ghidra_project");
     }
 
     /**
-     * Initialize Ghidra in headless mode.
+     * Initialize Ghidra in headless mode using the installation directory.
      */
     public void initialize() throws Exception {
         if (initialized) return;
 
         if (!Application.isInitialized()) {
+            System.out.println("[Ghidra] Initializing from: " + GHIDRA_HOME);
+
+            File ghidraInstallDir = new File(GHIDRA_HOME);
+            if (!ghidraInstallDir.exists()) {
+                throw new RuntimeException("Ghidra installation not found at: " + GHIDRA_HOME);
+            }
+
+            // Use GhidraApplicationLayout with the installation directory
+            GhidraApplicationLayout layout = new GhidraApplicationLayout(ghidraInstallDir);
             ApplicationConfiguration config = new HeadlessGhidraApplicationConfiguration();
-            Application.initializeApplication(new GhidraJarApplicationLayout(), config);
+            Application.initializeApplication(layout, config);
+
+            System.out.println("[Ghidra] Application initialized successfully");
         }
 
         projectDir.mkdirs();
         initialized = true;
-        System.out.println("[Ghidra] Initialized headless Ghidra");
+        System.out.println("[Ghidra] Ready for analysis");
     }
 
     /**
-     * Analyze a DEX file and extract comprehensive information.
+     * Analyze a binary file (DEX or native library) and extract comprehensive information.
      */
-    public AnalysisResult analyzeDexFile(File dexFile) throws Exception {
+    public AnalysisResult analyzeFile(File binaryFile) throws Exception {
         initialize();
 
-        System.out.println("[Ghidra] Analyzing: " + dexFile.getName());
+        System.out.println("[Ghidra] Analyzing: " + binaryFile.getName() +
+                         " (" + formatSize(binaryFile.length()) + ")");
 
         AnalysisResult result = new AnalysisResult();
-        result.fileName = dexFile.getName();
+        result.fileName = binaryFile.getName();
+        result.fileSize = binaryFile.length();
 
         GhidraProject project = null;
         try {
             // Create a temporary project
             String projectPath = projectDir.getAbsolutePath();
-            String projectName = "APKAnalysis_" + System.currentTimeMillis();
+            String projectName = "Analysis_" + System.currentTimeMillis();
+
+            System.out.println("[Ghidra] Creating project: " + projectName);
             project = GhidraProject.createProject(projectPath, projectName, true);
 
-            // Import the DEX file
-            Program program = project.importProgram(dexFile);
+            // Import the binary file
+            System.out.println("[Ghidra] Importing file...");
+            Program program = project.importProgram(binaryFile);
 
             if (program == null) {
-                result.errors.add("Failed to import file: " + dexFile.getName());
+                result.errors.add("Failed to import file: " + binaryFile.getName());
                 return result;
             }
 
+            System.out.println("[Ghidra] Running auto-analysis...");
             // Run auto-analysis
             project.analyze(program, true);
 
+            System.out.println("[Ghidra] Extracting analysis data...");
+
+            // Get program info
+            result.programName = program.getName();
+            result.languageId = program.getLanguageID().getIdAsString();
+            result.compilerSpec = program.getCompilerSpec().getCompilerSpecID().getIdAsString();
+            result.imageBase = program.getImageBase().toString();
+
             // Get all functions
             FunctionIterator functions = program.getFunctionManager().getFunctions(true);
+            int funcCount = 0;
             while (functions.hasNext()) {
                 Function func = functions.next();
                 FunctionInfo funcInfo = new FunctionInfo();
@@ -88,40 +119,51 @@ public class GhidraAnalyzer {
                 funcInfo.callingConvention = func.getCallingConventionName();
                 funcInfo.parameterCount = func.getParameterCount();
                 funcInfo.isThunk = func.isThunk();
+                funcInfo.isExternal = func.isExternal();
+                funcInfo.bodySize = func.getBody().getNumAddresses();
 
-                // Get called functions
+                // Get called functions (limit to avoid memory issues)
                 try {
-                    for (Function calledFunc : func.getCalledFunctions(TaskMonitor.DUMMY)) {
-                        funcInfo.calledFunctions.add(calledFunc.getName());
-                    }
-                } catch (Exception e) {
-                    // Ignore call analysis errors
-                }
-
-                // Get calling functions
-                try {
-                    for (Function callingFunc : func.getCallingFunctions(TaskMonitor.DUMMY)) {
-                        funcInfo.callingFunctions.add(callingFunc.getName());
+                    Set<Function> called = func.getCalledFunctions(TaskMonitor.DUMMY);
+                    for (Function calledFunc : called) {
+                        if (funcInfo.calledFunctions.size() < 50) {
+                            funcInfo.calledFunctions.add(calledFunc.getName());
+                        }
                     }
                 } catch (Exception e) {
                     // Ignore call analysis errors
                 }
 
                 result.functions.add(funcInfo);
+                funcCount++;
+
+                // Progress logging
+                if (funcCount % 1000 == 0) {
+                    System.out.println("[Ghidra] Processed " + funcCount + " functions...");
+                }
             }
 
-            // Get all strings
+            // Get all defined strings
             DataIterator dataIter = program.getListing().getDefinedData(true);
             while (dataIter.hasNext()) {
                 Data data = dataIter.next();
                 DataType dt = data.getDataType();
-                if (dt instanceof StringDataType ||
-                    (dt != null && dt.getName().toLowerCase().contains("string"))) {
-                    Object value = data.getValue();
-                    if (value != null) {
-                        result.strings.add(value.toString());
+                if (dt != null) {
+                    String typeName = dt.getName().toLowerCase();
+                    if (typeName.contains("string") || typeName.equals("char[]")) {
+                        Object value = data.getValue();
+                        if (value != null) {
+                            String str = value.toString();
+                            // Filter out very short or very long strings
+                            if (str.length() >= 4 && str.length() <= 500) {
+                                result.strings.add(str);
+                            }
+                        }
                     }
                 }
+
+                // Limit strings to avoid memory issues
+                if (result.strings.size() >= 5000) break;
             }
 
             // Get all imports/external references
@@ -130,6 +172,15 @@ public class GhidraAnalyzer {
             while (extSymbols.hasNext()) {
                 Symbol sym = extSymbols.next();
                 result.imports.add(sym.getName());
+            }
+
+            // Get exports
+            SymbolIterator allSymbols = symTable.getAllSymbols(true);
+            while (allSymbols.hasNext()) {
+                Symbol sym = allSymbols.next();
+                if (sym.isExternalEntryPoint()) {
+                    result.exports.add(sym.getName());
+                }
             }
 
             // Get memory sections
@@ -143,20 +194,30 @@ public class GhidraAnalyzer {
                 section.isRead = block.isRead();
                 section.isWrite = block.isWrite();
                 section.isExecute = block.isExecute();
+                section.isInitialized = block.isInitialized();
                 result.memorySections.add(section);
             }
 
             // Get data types (structures)
             DataTypeManager dtm = program.getDataTypeManager();
             Iterator<DataType> dtIter = dtm.getAllDataTypes();
-            while (dtIter.hasNext()) {
+            int structCount = 0;
+            while (dtIter.hasNext() && structCount < 500) {
                 DataType dt = dtIter.next();
                 if (dt instanceof Structure) {
-                    result.structures.add(dt.getName() + ": " + dt.getDescription());
+                    Structure struct = (Structure) dt;
+                    StructureInfo structInfo = new StructureInfo();
+                    structInfo.name = struct.getName();
+                    structInfo.size = struct.getLength();
+                    structInfo.fieldCount = struct.getNumComponents();
+                    result.structures.add(structInfo);
+                    structCount++;
                 }
             }
 
             result.success = true;
+            System.out.println("[Ghidra] Analysis complete: " + result.functions.size() + " functions, " +
+                             result.strings.size() + " strings, " + result.imports.size() + " imports");
 
         } catch (Exception e) {
             result.errors.add("Analysis error: " + e.getMessage());
@@ -179,33 +240,56 @@ public class GhidraAnalyzer {
      */
     public void generateReport(AnalysisResult result, File reportFile) throws Exception {
         try (PrintWriter writer = new PrintWriter(new FileWriter(reportFile))) {
-            writer.println("=" .repeat(80));
-            writer.println("GHIDRA ANALYSIS REPORT");
-            writer.println("=" .repeat(80));
+            writer.println("=".repeat(80));
+            writer.println("GHIDRA BINARY ANALYSIS REPORT");
+            writer.println("=".repeat(80));
             writer.println("File: " + result.fileName);
+            writer.println("Size: " + formatSize(result.fileSize));
             writer.println("Analysis Date: " + new Date());
             writer.println();
+
+            if (result.programName != null) {
+                writer.println("-".repeat(80));
+                writer.println("PROGRAM INFO");
+                writer.println("-".repeat(80));
+                writer.println("  Program Name: " + result.programName);
+                writer.println("  Language: " + result.languageId);
+                writer.println("  Compiler: " + result.compilerSpec);
+                writer.println("  Image Base: " + result.imageBase);
+                writer.println();
+            }
 
             writer.println("-".repeat(80));
             writer.println("MEMORY SECTIONS (" + result.memorySections.size() + ")");
             writer.println("-".repeat(80));
             for (MemorySection section : result.memorySections) {
-                writer.printf("  %-20s %s - %s (size: %d) [%s%s%s]%n",
-                    section.name, section.start, section.end, section.size,
+                writer.printf("  %-20s %s - %s (size: %s) [%s%s%s%s]%n",
+                    section.name, section.start, section.end, formatSize(section.size),
                     section.isRead ? "R" : "-",
                     section.isWrite ? "W" : "-",
-                    section.isExecute ? "X" : "-");
+                    section.isExecute ? "X" : "-",
+                    section.isInitialized ? "I" : "-");
             }
             writer.println();
 
             writer.println("-".repeat(80));
             writer.println("FUNCTIONS (" + result.functions.size() + ")");
             writer.println("-".repeat(80));
+            int shown = 0;
             for (FunctionInfo func : result.functions) {
-                writer.printf("  [%s] %s%n", func.address, func.signature);
-                if (!func.calledFunctions.isEmpty()) {
-                    writer.println("    Calls: " + String.join(", ", func.calledFunctions.stream().limit(5).toList()));
+                if (shown++ < 100) {
+                    writer.printf("  [%s] %s%s%n",
+                        func.address,
+                        func.signature,
+                        func.isExternal ? " [EXTERNAL]" : "");
+                    if (!func.calledFunctions.isEmpty()) {
+                        writer.println("    Calls: " + String.join(", ",
+                            func.calledFunctions.stream().limit(5).toList()));
+                    }
                 }
+            }
+            if (result.functions.size() > 100) {
+                writer.println("  ... and " + (result.functions.size() - 100) + " more functions");
             }
             writer.println();
 
@@ -215,16 +299,38 @@ public class GhidraAnalyzer {
             for (String imp : result.imports.stream().limit(100).toList()) {
                 writer.println("  " + imp);
             }
+            if (result.imports.size() > 100) {
+                writer.println("  ... and " + (result.imports.size() - 100) + " more");
+            }
             writer.println();
+
+            if (!result.exports.isEmpty()) {
+                writer.println("-".repeat(80));
+                writer.println("EXPORTS (" + result.exports.size() + ")");
+                writer.println("-".repeat(80));
+                for (String exp : result.exports.stream().limit(50).toList()) {
+                    writer.println("  " + exp);
+                }
+                writer.println();
+            }
+
+            if (!result.structures.isEmpty()) {
+                writer.println("-".repeat(80));
+                writer.println("STRUCTURES (" + result.structures.size() + ")");
+                writer.println("-".repeat(80));
+                for (StructureInfo struct : result.structures.stream().limit(50).toList()) {
+                    writer.printf("  %-40s size: %d, fields: %d%n",
+                        struct.name, struct.size, struct.fieldCount);
+                }
+                writer.println();
+            }
 
             writer.println("-".repeat(80));
             writer.println("STRINGS (first 100 of " + result.strings.size() + ")");
             writer.println("-".repeat(80));
             for (String str : result.strings.stream().limit(100).toList()) {
-                if (str.length() > 100) {
-                    str = str.substring(0, 100) + "...";
-                }
-                writer.println("  " + str.replace("\n", "\\n"));
+                String display = str.length() > 80 ? str.substring(0, 80) + "..." : str;
+                writer.println("  " + display.replace("\n", "\\n").replace("\r", "\\r"));
             }
 
             if (!result.errors.isEmpty()) {
@@ -241,15 +347,30 @@ public class GhidraAnalyzer {
         System.out.println("[Ghidra] Report written to: " + reportFile.getAbsolutePath());
     }
 
+    private String formatSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
+        if (bytes < 1024 * 1024 * 1024) return String.format("%.1f MB", bytes / (1024.0 * 1024));
+        return String.format("%.1f GB", bytes / (1024.0 * 1024 * 1024));
+    }
+
     // Data classes for analysis results
     public static class AnalysisResult {
         public String fileName;
+        public long fileSize;
         public boolean success = false;
+
+        public String programName;
+        public String languageId;
+        public String compilerSpec;
+        public String imageBase;
+
         public List<FunctionInfo> functions = new ArrayList<>();
         public List<String> strings = new ArrayList<>();
         public List<String> imports = new ArrayList<>();
+        public List<String> exports = new ArrayList<>();
         public List<MemorySection> memorySections = new ArrayList<>();
-        public List<String> structures = new ArrayList<>();
+        public List<StructureInfo> structures = new ArrayList<>();
         public List<String> errors = new ArrayList<>();
     }
 
@@ -260,8 +381,9 @@ public class GhidraAnalyzer {
         public String callingConvention;
         public int parameterCount;
         public boolean isThunk;
+        public boolean isExternal;
+        public long bodySize;
         public List<String> calledFunctions = new ArrayList<>();
-        public List<String> callingFunctions = new ArrayList<>();
     }
 
     public static class MemorySection {
@@ -272,5 +394,12 @@ public class GhidraAnalyzer {
         public boolean isRead;
         public boolean isWrite;
         public boolean isExecute;
+        public boolean isInitialized;
+    }
+
+    public static class StructureInfo {
+        public String name;
+        public int size;
+        public int fieldCount;
     }
 }

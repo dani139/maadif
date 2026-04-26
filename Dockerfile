@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Android tools
     android-tools-adb android-tools-fastboot \
     # Build tools
-    build-essential cmake ninja-build pkg-config maven aapt gradle \
+    build-essential cmake ninja-build pkg-config maven aapt \
     # Libraries
     libssl-dev libffi-dev zlib1g-dev \
     # Terminal tools
@@ -130,22 +130,6 @@ RUN curl -fsSL -o /opt/Cutter.AppImage \
     chmod +x /opt/Cutter.AppImage
 
 # -----------------------------------------------------------------------------
-# Stage: api-builder - Build the MAADIF Java API
-# -----------------------------------------------------------------------------
-FROM base AS api-builder
-
-WORKDIR /build
-
-# Copy Gradle files first for caching
-COPY build.gradle settings.gradle ./
-
-# Copy source code
-COPY src ./src
-
-# Build fat JAR
-RUN gradle jar --no-daemon
-
-# -----------------------------------------------------------------------------
 # Stage: final - Combine everything
 # -----------------------------------------------------------------------------
 FROM base AS final
@@ -219,29 +203,12 @@ RUN pip install --break-system-packages --no-cache-dir \
 # Update library cache for radare2
 RUN ldconfig
 
-# Copy MAADIF API JAR
-COPY --from=api-builder /build/build/libs/maadif-1.0.0.jar /opt/maadif/maadif.jar
-
-# Copy Ghidra analysis scripts
-COPY scripts/ghidra/*.py /opt/ghidra/Ghidra/Features/Python/ghidra_scripts/
-
-# Create maadif wrapper script
-RUN printf '#!/bin/sh\nexec java -jar /opt/maadif/maadif.jar "$@"\n' > /usr/local/bin/maadif && \
-    chmod +x /usr/local/bin/maadif
-
 # Environment variables
 ENV GHIDRA_INSTALL_DIR=/opt/ghidra
 ENV PATH="/opt/ghidra:/opt/ghidra/support:/opt/jadx/bin:/opt/dex2jar:${PATH}"
-ENV MAADIF_APKS_DIR=/workspace/apks
-ENV MAADIF_OUTPUT_DIR=/workspace/output
-ENV MAADIF_PORT=8080
 
-# Create workspace directories
+# Create workspace
 WORKDIR /workspace
-RUN mkdir -p /workspace/apks /workspace/output
 
-# Expose API port
-EXPOSE 8080
-
-# Default: start the API server
-CMD ["java", "-jar", "/opt/maadif/maadif.jar"]
+# Default command
+CMD ["/bin/bash"]

@@ -1,5 +1,6 @@
 - how to download them new ones
 - start analysis, with configs all natives, or only 1 for testing.
+- what ever warning obfuscted code have flag in db for it.
 
 
 # MAADIF - Mobile & Application Analysis Docker Image Framework

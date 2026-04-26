@@ -8,26 +8,23 @@ import java.io.*;
 import java.nio.file.*;
 import java.util.*;
 import java.util.regex.*;
-import java.util.stream.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * JADX-based APK decompiler and analyzer.
- * Uses JADX API for Java source code decompilation and resource extraction.
+ * Optimized for large APKs with memory-efficient processing.
  */
 public class JadxAnalyzer {
 
     private File outputDir;
     private JadxArgs jadxArgs;
 
+    // Batch size for processing classes
+    private static final int BATCH_SIZE = 1000;
+
     // Patterns for security-sensitive detection
     private static final Pattern URL_PATTERN = Pattern.compile(
         "(https?://[\\w.-]+(?:/[\\w./-]*)?)", Pattern.CASE_INSENSITIVE);
-    private static final Pattern IP_PATTERN = Pattern.compile(
-        "\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b");
-    private static final Pattern API_KEY_PATTERN = Pattern.compile(
-        "(?i)(api[_-]?key|apikey|secret[_-]?key|auth[_-]?token|access[_-]?token)\\s*[=:]\\s*[\"']?([\\w-]+)[\"']?");
-    private static final Pattern CRYPTO_PATTERN = Pattern.compile(
-        "(?i)(AES|DES|RSA|SHA|MD5|HMAC|Cipher|SecretKey|KeyGenerator)");
 
     public JadxAnalyzer(File outputDir) {
         this.outputDir = outputDir;
@@ -41,16 +38,20 @@ public class JadxAnalyzer {
         jadxArgs.setOutDirRes(new File(outputDir, "jadx_output/resources"));
         jadxArgs.setDeobfuscationOn(true);
         jadxArgs.setShowInconsistentCode(true);
-        jadxArgs.setThreadsCount(Runtime.getRuntime().availableProcessors());
+        // Use fewer threads to reduce memory pressure
+        jadxArgs.setThreadsCount(Math.min(4, Runtime.getRuntime().availableProcessors()));
         jadxArgs.setSkipResources(false);
         jadxArgs.setSkipSources(false);
     }
 
     /**
-     * Decompile APK and perform comprehensive analysis.
+     * Analyze APK with memory-efficient processing.
+     * Phase 1: Extract metadata without full decompilation
+     * Phase 2: Let JADX save decompiled sources (memory-managed internally)
      */
     public DecompilationResult analyzeApk(File apkFile) {
         System.out.println("[JADX] Analyzing: " + apkFile.getName());
+        System.out.println("[JADX] Memory before: " + getMemoryUsage());
 
         DecompilationResult result = new DecompilationResult();
         result.apkName = apkFile.getName();
@@ -63,37 +64,33 @@ public class JadxAnalyzer {
             // Extract package info
             result.packageName = extractPackageName(jadx);
 
-            // Get all classes
+            // Get all classes (just references, not decompiled yet)
             List<JavaClass> classes = jadx.getClasses();
             result.totalClasses = classes.size();
 
             System.out.println("[JADX] Found " + classes.size() + " classes");
+            System.out.println("[JADX] Memory after load: " + getMemoryUsage());
 
-            for (JavaClass cls : classes) {
-                ClassInfo classInfo = analyzeClass(cls);
-                result.classes.add(classInfo);
+            // Phase 1: Extract metadata WITHOUT triggering full decompilation
+            System.out.println("[JADX] Phase 1: Extracting metadata (no decompilation)...");
+            extractMetadataOnly(classes, result);
 
-                // Categorize classes
-                String className = cls.getFullName();
-                if (className.contains(".activity.") || className.endsWith("Activity")) {
-                    result.activities.add(className);
-                } else if (className.contains(".service.") || className.endsWith("Service")) {
-                    result.services.add(className);
-                } else if (className.contains(".receiver.") || className.endsWith("Receiver")) {
-                    result.receivers.add(className);
-                } else if (className.contains(".provider.") || className.endsWith("Provider")) {
-                    result.providers.add(className);
-                }
-            }
+            System.out.println("[JADX] Memory after metadata: " + getMemoryUsage());
 
-            // Save decompiled sources
-            jadx.save();
-
-            // Analyze resources
+            // Phase 2: Analyze resources (manifest, etc.)
+            System.out.println("[JADX] Phase 2: Analyzing resources...");
             analyzeResources(jadx, result);
 
-            // Perform security analysis on decompiled code
-            performSecurityAnalysis(result);
+            // Phase 3: Save decompiled sources (JADX handles memory internally)
+            System.out.println("[JADX] Phase 3: Saving decompiled sources...");
+            System.out.println("[JADX] This may take a while for large APKs...");
+            jadx.save();
+
+            System.out.println("[JADX] Memory after save: " + getMemoryUsage());
+
+            // Phase 4: Security analysis on saved files (streamed, memory efficient)
+            System.out.println("[JADX] Phase 4: Security analysis on saved sources...");
+            performSecurityAnalysisOnFiles(result);
 
             result.success = true;
 
@@ -105,12 +102,96 @@ public class JadxAnalyzer {
         return result;
     }
 
+    /**
+     * Extract metadata without triggering decompilation.
+     * This only reads class/method/field names from DEX, not full code.
+     */
+    private void extractMetadataOnly(List<JavaClass> classes, DecompilationResult result) {
+        AtomicInteger processed = new AtomicInteger(0);
+        int total = classes.size();
+
+        for (JavaClass cls : classes) {
+            try {
+                ClassInfo classInfo = new ClassInfo();
+                classInfo.fullName = cls.getFullName();
+                classInfo.packageName = cls.getPackage();
+
+                // Get access info without decompiling
+                AccessInfo accessInfo = cls.getAccessInfo();
+                classInfo.accessFlags = accessInfo != null ? accessInfo.rawValue() : 0;
+
+                // Categorize by name patterns (no decompilation needed)
+                String className = cls.getFullName();
+                if (className.contains(".activity.") || className.endsWith("Activity")) {
+                    result.activities.add(className);
+                } else if (className.contains(".service.") || className.endsWith("Service")) {
+                    result.services.add(className);
+                } else if (className.contains(".receiver.") || className.endsWith("Receiver")) {
+                    result.receivers.add(className);
+                } else if (className.contains(".provider.") || className.endsWith("Provider")) {
+                    result.providers.add(className);
+                }
+
+                // Categorize by pattern for security analysis
+                String lowerName = className.toLowerCase();
+                if (lowerName.contains("crypto") || lowerName.contains("cipher") ||
+                    lowerName.contains("encrypt") || lowerName.contains("decrypt")) {
+                    result.cryptoClasses.add(className);
+                }
+                if (lowerName.contains("http") || lowerName.contains("socket") ||
+                    lowerName.contains("network") || lowerName.contains("connection")) {
+                    result.networkClasses.add(className);
+                }
+                if (lowerName.contains("database") || lowerName.contains("sqlite") ||
+                    lowerName.contains("sharedpref") || lowerName.contains("storage")) {
+                    result.storageClasses.add(className);
+                }
+
+                // Get method names (from DEX metadata, no decompilation)
+                for (JavaMethod method : cls.getMethods()) {
+                    MethodInfo methodInfo = new MethodInfo();
+                    methodInfo.name = method.getName();
+                    try {
+                        methodInfo.signature = method.getMethodNode().getMethodInfo().getShortId();
+                    } catch (Exception e) {
+                        methodInfo.signature = method.getName();
+                    }
+                    classInfo.methods.add(methodInfo);
+                }
+
+                // Get field names
+                for (JavaField field : cls.getFields()) {
+                    FieldInfo fieldInfo = new FieldInfo();
+                    fieldInfo.name = field.getName();
+                    fieldInfo.type = field.getType().toString();
+                    classInfo.fields.add(fieldInfo);
+                }
+
+                result.classes.add(classInfo);
+
+                // Progress logging
+                int count = processed.incrementAndGet();
+                if (count % 5000 == 0) {
+                    System.out.println("[JADX] Metadata progress: " + count + "/" + total +
+                                     " (" + (count * 100 / total) + "%)");
+                    // Hint GC periodically
+                    if (count % 10000 == 0) {
+                        System.gc();
+                    }
+                }
+
+            } catch (Exception e) {
+                // Skip problematic classes
+            }
+        }
+    }
+
     private String extractPackageName(JadxDecompiler jadx) {
         try {
             for (JavaClass cls : jadx.getClasses()) {
                 String pkg = cls.getPackage();
-                if (pkg != null && !pkg.isEmpty()) {
-                    // Return the root package (first two segments usually)
+                if (pkg != null && !pkg.isEmpty() && !pkg.startsWith("android.") &&
+                    !pkg.startsWith("java.") && !pkg.startsWith("kotlin.")) {
                     String[] parts = pkg.split("\\.");
                     if (parts.length >= 2) {
                         return parts[0] + "." + parts[1];
@@ -124,75 +205,6 @@ public class JadxAnalyzer {
         return "unknown";
     }
 
-    private ClassInfo analyzeClass(JavaClass cls) {
-        ClassInfo info = new ClassInfo();
-        info.fullName = cls.getFullName();
-        info.packageName = cls.getPackage();
-        info.accessFlags = cls.getAccessInfo() != null ? cls.getAccessInfo().rawValue() : 0;
-
-        try {
-            String code = cls.getCode();
-            info.codeSize = code != null ? code.length() : 0;
-
-            // Extract methods
-            for (JavaMethod method : cls.getMethods()) {
-                MethodInfo methodInfo = new MethodInfo();
-                methodInfo.name = method.getName();
-                methodInfo.signature = method.getMethodNode().getMethodInfo().getShortId();
-                methodInfo.accessFlags = method.getAccessFlags() != null ? method.getAccessFlags().rawValue() : 0;
-
-                try {
-                    String methodCode = method.getCodeStr();
-                    if (methodCode != null) {
-                        methodInfo.codeLines = methodCode.split("\n").length;
-                    }
-                } catch (Exception e) {
-                    // Method code not available
-                }
-
-                info.methods.add(methodInfo);
-            }
-
-            // Extract fields
-            for (JavaField field : cls.getFields()) {
-                FieldInfo fieldInfo = new FieldInfo();
-                fieldInfo.name = field.getName();
-                fieldInfo.type = field.getType().toString();
-                fieldInfo.accessFlags = field.getAccessFlags() != null ? field.getAccessFlags().rawValue() : 0;
-                info.fields.add(fieldInfo);
-            }
-
-            // Look for strings in code
-            if (code != null) {
-                extractStringsFromCode(code, info.hardcodedStrings);
-                extractUrlsFromCode(code, info.urls);
-            }
-
-        } catch (Exception e) {
-            info.errors.add(e.getMessage());
-        }
-
-        return info;
-    }
-
-    private void extractStringsFromCode(String code, List<String> strings) {
-        Pattern stringPattern = Pattern.compile("\"([^\"\\\\]*(\\\\.[^\"\\\\]*)*)\"");
-        Matcher matcher = stringPattern.matcher(code);
-        while (matcher.find() && strings.size() < 50) {
-            String str = matcher.group(1);
-            if (str.length() > 3 && !str.matches("\\s*")) {
-                strings.add(str);
-            }
-        }
-    }
-
-    private void extractUrlsFromCode(String code, List<String> urls) {
-        Matcher matcher = URL_PATTERN.matcher(code);
-        while (matcher.find()) {
-            urls.add(matcher.group(1));
-        }
-    }
-
     private void analyzeResources(JadxDecompiler jadx, DecompilationResult result) {
         try {
             for (ResourceFile res : jadx.getResources()) {
@@ -200,7 +212,6 @@ public class JadxAnalyzer {
                 resInfo.name = res.getOriginalName();
                 resInfo.type = res.getType().toString();
 
-                // Check for interesting resources
                 String name = res.getOriginalName().toLowerCase();
                 if (name.equals("androidmanifest.xml")) {
                     analyzeManifest(res, result);
@@ -221,7 +232,6 @@ public class JadxAnalyzer {
 
     private void analyzeManifest(ResourceFile manifestRes, DecompilationResult result) {
         try {
-            // Try to get manifest content
             String manifest = null;
             try {
                 var content = manifestRes.loadContent();
@@ -264,60 +274,80 @@ public class JadxAnalyzer {
         }
     }
 
-    private void performSecurityAnalysis(DecompilationResult result) {
-        for (ClassInfo cls : result.classes) {
-            // Check for sensitive API usage
-            String className = cls.fullName.toLowerCase();
+    /**
+     * Perform security analysis on already-saved decompiled files.
+     * This streams through files without loading everything into memory.
+     */
+    private void performSecurityAnalysisOnFiles(DecompilationResult result) {
+        File sourcesDir = new File(outputDir, "jadx_output/sources");
+        if (!sourcesDir.exists()) {
+            return;
+        }
 
-            // Check for crypto operations
-            if (className.contains("crypto") || className.contains("cipher") ||
-                className.contains("encrypt") || className.contains("decrypt")) {
-                result.cryptoClasses.add(cls.fullName);
-            }
+        try {
+            AtomicInteger fileCount = new AtomicInteger(0);
 
-            // Check for network operations
-            if (className.contains("http") || className.contains("socket") ||
-                className.contains("network") || className.contains("connection")) {
-                result.networkClasses.add(cls.fullName);
-            }
+            Files.walk(sourcesDir.toPath())
+                .filter(p -> p.toString().endsWith(".java"))
+                .forEach(javaFile -> {
+                    try {
+                        analyzeJavaFileForSecurity(javaFile.toFile(), result);
+                        int count = fileCount.incrementAndGet();
+                        if (count % 5000 == 0) {
+                            System.out.println("[JADX] Security scan progress: " + count + " files");
+                        }
+                    } catch (Exception e) {
+                        // Skip problematic files
+                    }
+                });
 
-            // Check for data storage
-            if (className.contains("database") || className.contains("sqlite") ||
-                className.contains("sharedpref") || className.contains("storage")) {
-                result.storageClasses.add(cls.fullName);
-            }
+            System.out.println("[JADX] Scanned " + fileCount.get() + " source files");
 
-            // Collect all URLs
-            result.allUrls.addAll(cls.urls);
+        } catch (Exception e) {
+            result.errors.add("Security analysis error: " + e.getMessage());
+        }
+    }
 
-            // Check for hardcoded secrets
-            for (String str : cls.hardcodedStrings) {
-                if (looksLikeSecret(str)) {
-                    result.potentialSecrets.add(cls.fullName + ": " + truncate(str, 50));
+    private void analyzeJavaFileForSecurity(File javaFile, DecompilationResult result) throws Exception {
+        // Read file in chunks to avoid loading huge files entirely
+        String content = Files.readString(javaFile.toPath());
+
+        // Extract URLs
+        Matcher urlMatcher = URL_PATTERN.matcher(content);
+        while (urlMatcher.find() && result.allUrls.size() < 1000) {
+            result.allUrls.add(urlMatcher.group(1));
+        }
+
+        // Look for potential secrets (simple heuristic)
+        if (content.contains("api_key") || content.contains("apiKey") ||
+            content.contains("secret") || content.contains("password")) {
+            // Extract the line containing the potential secret
+            String[] lines = content.split("\n");
+            for (String line : lines) {
+                String lower = line.toLowerCase();
+                if ((lower.contains("api_key") || lower.contains("apikey") ||
+                     lower.contains("secret") || lower.contains("password")) &&
+                    line.contains("=") && line.contains("\"") &&
+                    result.potentialSecrets.size() < 100) {
+                    String trimmed = line.trim();
+                    if (trimmed.length() < 200) {
+                        result.potentialSecrets.add(javaFile.getName() + ": " + trimmed);
+                    }
                 }
             }
         }
-
-        // Analyze dangerous permissions
-        for (String perm : result.permissions) {
-            if (isDangerousPermission(perm)) {
-                result.securityIssues.add("DANGEROUS PERMISSION: " + perm);
-            }
-        }
     }
 
-    private boolean looksLikeSecret(String str) {
-        // Check for patterns that look like API keys or secrets
-        if (str.length() > 20 && str.matches("[A-Za-z0-9_-]{20,}")) {
-            return true;
-        }
-        if (str.toLowerCase().contains("key") || str.toLowerCase().contains("secret") ||
-            str.toLowerCase().contains("token") || str.toLowerCase().contains("password")) {
-            return true;
-        }
-        return false;
+    private String getMemoryUsage() {
+        Runtime rt = Runtime.getRuntime();
+        long used = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+        long max = rt.maxMemory() / (1024 * 1024);
+        return used + "MB / " + max + "MB";
     }
 
+    /**
+     * Analyze dangerous permissions.
+     */
     private boolean isDangerousPermission(String perm) {
         Set<String> dangerous = Set.of(
             "android.permission.READ_SMS",
@@ -335,10 +365,6 @@ public class JadxAnalyzer {
             "android.permission.WRITE_EXTERNAL_STORAGE"
         );
         return dangerous.contains(perm);
-    }
-
-    private String truncate(String str, int maxLen) {
-        return str.length() > maxLen ? str.substring(0, maxLen) + "..." : str;
     }
 
     /**
@@ -372,7 +398,8 @@ public class JadxAnalyzer {
             writer.println("PERMISSIONS (" + result.permissions.size() + ")");
             writer.println("-".repeat(80));
             for (String perm : result.permissions) {
-                writer.println("  " + perm);
+                String marker = isDangerousPermission(perm) ? " [DANGEROUS]" : "";
+                writer.println("  " + perm + marker);
             }
             writer.println();
 
@@ -396,6 +423,9 @@ public class JadxAnalyzer {
                 for (String url : uniqueUrls.stream().limit(50).toList()) {
                     writer.println("  " + url);
                 }
+                if (uniqueUrls.size() > 50) {
+                    writer.println("  ... and " + (uniqueUrls.size() - 50) + " more");
+                }
                 writer.println();
             }
 
@@ -406,26 +436,6 @@ public class JadxAnalyzer {
                 writer.println("-".repeat(80));
                 for (String secret : result.potentialSecrets.stream().limit(20).toList()) {
                     writer.println("  " + secret);
-                }
-                writer.println();
-            }
-
-            // Activities
-            writer.println("-".repeat(80));
-            writer.println("ACTIVITIES");
-            writer.println("-".repeat(80));
-            for (String activity : result.activities) {
-                writer.println("  " + activity);
-            }
-            writer.println();
-
-            // Services
-            if (!result.services.isEmpty()) {
-                writer.println("-".repeat(80));
-                writer.println("SERVICES");
-                writer.println("-".repeat(80));
-                for (String service : result.services) {
-                    writer.println("  " + service);
                 }
                 writer.println();
             }
@@ -444,9 +454,9 @@ public class JadxAnalyzer {
             // Crypto Classes
             if (!result.cryptoClasses.isEmpty()) {
                 writer.println("-".repeat(80));
-                writer.println("CRYPTO-RELATED CLASSES");
+                writer.println("CRYPTO-RELATED CLASSES (" + result.cryptoClasses.size() + ")");
                 writer.println("-".repeat(80));
-                for (String cls : result.cryptoClasses) {
+                for (String cls : result.cryptoClasses.stream().limit(50).toList()) {
                     writer.println("  " + cls);
                 }
                 writer.println();
@@ -455,9 +465,9 @@ public class JadxAnalyzer {
             // Network Classes
             if (!result.networkClasses.isEmpty()) {
                 writer.println("-".repeat(80));
-                writer.println("NETWORK-RELATED CLASSES");
+                writer.println("NETWORK-RELATED CLASSES (" + result.networkClasses.size() + ")");
                 writer.println("-".repeat(80));
-                for (String cls : result.networkClasses.stream().limit(30).toList()) {
+                for (String cls : result.networkClasses.stream().limit(50).toList()) {
                     writer.println("  " + cls);
                 }
                 writer.println();

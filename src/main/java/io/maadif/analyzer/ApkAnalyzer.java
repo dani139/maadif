@@ -164,7 +164,7 @@ public class ApkAnalyzer {
                 File dexFile = new File(extractDir, dexFileName);
                 if (dexFile.exists()) {
                     try {
-                        GhidraAnalyzer.AnalysisResult ghidraResult = ghidraAnalyzer.analyzeDexFile(dexFile);
+                        GhidraAnalyzer.AnalysisResult ghidraResult = ghidraAnalyzer.analyzeFile(dexFile);
                         result.ghidraResults.add(ghidraResult);
 
                         // Generate Ghidra-specific report for each DEX
@@ -188,7 +188,7 @@ public class ApkAnalyzer {
                 File libFile = new File(extractDir, soFile);
                 if (libFile.exists() && libFile.length() < 50 * 1024 * 1024) { // Skip files > 50MB
                     try {
-                        GhidraAnalyzer.AnalysisResult ghidraResult = ghidraAnalyzer.analyzeDexFile(libFile);
+                        GhidraAnalyzer.AnalysisResult ghidraResult = ghidraAnalyzer.analyzeFile(libFile);
                         result.ghidraResults.add(ghidraResult);
 
                         String reportName = "ghidra_" + soFile.replace("/", "_").replace(".so", "") + "_report.txt";

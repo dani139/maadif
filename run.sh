@@ -34,7 +34,9 @@ done
 CLASSPATH="target/maadif-analyzer-1.0.0.jar:$JADX_CP$GHIDRA_CP"
 
 # Set memory options (increase for large APKs)
-JAVA_OPTS="-Xmx8g -Xms2g"
+# -XX:+UseG1GC for better memory management with large heaps
+# -XX:MaxGCPauseMillis=200 for responsive GC
+JAVA_OPTS="-Xmx16g -Xms4g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
 
 # Run analyzer
 if [ -n "$OUTPUT_DIR" ]; then
