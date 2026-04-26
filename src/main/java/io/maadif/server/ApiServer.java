@@ -205,7 +205,7 @@ public class ApiServer {
         for (File file : files) {
             if (file.isDirectory()) {
                 findApks(baseDir, file, apks);
-            } else if (file.getName().endsWith(".apk")) {
+            } else if (file.getName().endsWith(".apk") || file.getName().endsWith(".xapk")) {
                 Map<String, Object> apk = new HashMap<>();
                 String relativePath = baseDir.toPath().relativize(file.toPath()).toString();
                 apk.put("path", relativePath);
