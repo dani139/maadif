@@ -1,3 +1,12 @@
+analyze last 2 stable versinos, from site test api.
+
+to to stable versions diffs. latest and one before.
+and 2 beta diffs.
+with timeing. and with report diff from it.
+
+after we have databases and decompiled.
+
+
 - how to download them new ones
 - start analysis, with configs all natives, or only 1 for testing.
 - what ever warning obfuscted code have flag in db for it.

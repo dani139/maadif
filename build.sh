@@ -41,12 +41,11 @@ mkdir -p "$JAR_DIR"
 
 echo -e "${YELLOW}[Build]${NC} Compiling Java sources..."
 
-# Find Java files - only our analyzer package (io.maadif.analyzer)
-# Skip com.maadif which needs Javalin and other deps
-JAVA_FILES=$(find "$SRC_DIR" -path "*/io/maadif/analyzer/*.java")
+# Find Java files - io.maadif.analyzer and io.maadif.server
+JAVA_FILES=$(find "$SRC_DIR" -path "*/io/maadif/*.java" -o -path "*/io/maadif/**/*.java" | sort -u)
 
 if [ -z "$JAVA_FILES" ]; then
-    echo -e "${RED}[Error]${NC} No Java files found in $SRC_DIR/io/maadif/analyzer"
+    echo -e "${RED}[Error]${NC} No Java files found in $SRC_DIR/io/maadif"
     exit 1
 fi
 

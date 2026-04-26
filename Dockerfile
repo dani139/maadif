@@ -179,6 +179,10 @@ RUN ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx && \
     ln -s /opt/jadx/bin/jadx-gui /usr/local/bin/jadx-gui && \
     ln -s /opt/dex2jar/d2j-dex2jar.sh /usr/local/bin/d2j-dex2jar
 
+# Download SQLite JDBC driver
+RUN curl -fsSL -o /opt/sqlite-jdbc.jar \
+    "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.45.1.0/sqlite-jdbc-3.45.1.0.jar"
+
 # Install Python packages
 RUN pip install --break-system-packages --no-cache-dir \
     androguard \
@@ -198,7 +202,9 @@ RUN pip install --break-system-packages --no-cache-dir \
     requests \
     httpx \
     pyghidra \
-    ghidriff
+    ghidriff \
+    cloudscraper \
+    beautifulsoup4
 
 # Update library cache for radare2
 RUN ldconfig

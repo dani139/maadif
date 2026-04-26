@@ -1,0 +1,99 @@
+@import "tailwindcss";
+
+/* Custom theme extending Tailwind */
+@theme {
+  --color-primary: #6366f1;
+  --color-primary-dark: #4f46e5;
+  --color-accent: #10b981;
+  --color-surface: #1e1e2e;
+  --color-surface-light: #2a2a3e;
+  --color-surface-lighter: #363650;
+  --color-text: #e2e8f0;
+  --color-text-muted: #94a3b8;
+  --color-border: #374151;
+  --color-success: #22c55e;
+  --color-warning: #f59e0b;
+  --color-error: #ef4444;
+  --color-beta: #f97316;
+}
+
+/* Base styles */
+body {
+  @apply bg-slate-950 text-slate-200 antialiased;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-slate-900;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-slate-700 rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-slate-600;
+}
+
+/* Custom utilities */
+@utility card {
+  @apply bg-slate-900 border border-slate-800 rounded-xl p-6;
+}
+
+@utility card-hover {
+  @apply card hover:border-slate-700 hover:bg-slate-900/80 transition-all duration-200;
+}
+
+@utility btn-primary {
+  @apply bg-indigo-600 hover:bg-indigo-500 text-white font-medium px-4 py-2 rounded-lg transition-colors duration-200 flex items-center gap-2;
+}
+
+@utility btn-secondary {
+  @apply bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium px-4 py-2 rounded-lg transition-colors duration-200 flex items-center gap-2 border border-slate-700;
+}
+
+@utility badge {
+  @apply px-2.5 py-0.5 rounded-full text-xs font-medium;
+}
+
+@utility badge-success {
+  @apply badge bg-emerald-500/20 text-emerald-400 border border-emerald-500/30;
+}
+
+@utility badge-warning {
+  @apply badge bg-amber-500/20 text-amber-400 border border-amber-500/30;
+}
+
+@utility badge-error {
+  @apply badge bg-red-500/20 text-red-400 border border-red-500/30;
+}
+
+@utility badge-beta {
+  @apply badge bg-orange-500/20 text-orange-400 border border-orange-500/30;
+}
+
+@utility badge-stable {
+  @apply badge bg-blue-500/20 text-blue-400 border border-blue-500/30;
+}
+
+@utility stat-card {
+  @apply card flex flex-col items-center justify-center text-center min-h-[120px];
+}
+
+@utility table-header {
+  @apply text-left text-xs font-semibold text-slate-400 uppercase tracking-wider px-4 py-3;
+}
+
+@utility table-cell {
+  @apply px-4 py-3 text-sm text-slate-300;
+}
+
+@utility table-row {
+  @apply border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors;
+}

@@ -11,6 +11,8 @@ import ghidra.program.model.address.*;
 import ghidra.program.model.mem.*;
 import ghidra.program.model.data.*;
 import ghidra.util.task.TaskMonitor;
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileResults;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -66,18 +68,21 @@ public class GhidraAnalyzer {
 
     /**
      * Analyze a binary file (DEX or native library) and extract comprehensive information.
+     * @param decompile If true, decompile functions to C pseudocode (slower but more detailed)
      */
-    public AnalysisResult analyzeFile(File binaryFile) throws Exception {
+    public AnalysisResult analyzeFile(File binaryFile, boolean decompile) throws Exception {
         initialize();
 
         System.out.println("[Ghidra] Analyzing: " + binaryFile.getName() +
-                         " (" + formatSize(binaryFile.length()) + ")");
+                         " (" + formatSize(binaryFile.length()) + ")" +
+                         (decompile ? " [with decompilation]" : ""));
 
         AnalysisResult result = new AnalysisResult();
         result.fileName = binaryFile.getName();
         result.fileSize = binaryFile.length();
 
         GhidraProject project = null;
+        DecompInterface decompiler = null;
         try {
             // Create a temporary project
             String projectPath = projectDir.getAbsolutePath();
@@ -107,9 +112,17 @@ public class GhidraAnalyzer {
             result.compilerSpec = program.getCompilerSpec().getCompilerSpecID().getIdAsString();
             result.imageBase = program.getImageBase().toString();
 
+            // Initialize decompiler if requested
+            if (decompile) {
+                System.out.println("[Ghidra] Initializing decompiler...");
+                decompiler = new DecompInterface();
+                decompiler.openProgram(program);
+            }
+
             // Get all functions
             FunctionIterator functions = program.getFunctionManager().getFunctions(true);
             int funcCount = 0;
+            int decompiled = 0;
             while (functions.hasNext()) {
                 Function func = functions.next();
                 FunctionInfo funcInfo = new FunctionInfo();
@@ -121,6 +134,22 @@ public class GhidraAnalyzer {
                 funcInfo.isThunk = func.isThunk();
                 funcInfo.isExternal = func.isExternal();
                 funcInfo.bodySize = func.getBody().getNumAddresses();
+
+                // Decompile function if requested and not external/thunk
+                if (decompile && !func.isExternal() && !func.isThunk() && func.getBody().getNumAddresses() > 0) {
+                    try {
+                        DecompileResults results = decompiler.decompileFunction(func, 30, TaskMonitor.DUMMY);
+                        if (results != null && results.decompileCompleted()) {
+                            String code = results.getDecompiledFunction().getC();
+                            if (code != null && !code.isEmpty()) {
+                                funcInfo.decompiledCode = code;
+                                decompiled++;
+                            }
+                        }
+                    } catch (Exception e) {
+                        // Decompilation failed for this function, continue
+                    }
+                }
 
                 // Get called functions (limit to avoid memory issues)
                 try {
@@ -138,9 +167,14 @@ public class GhidraAnalyzer {
                 funcCount++;
 
                 // Progress logging
-                if (funcCount % 1000 == 0) {
-                    System.out.println("[Ghidra] Processed " + funcCount + " functions...");
+                if (funcCount % 500 == 0) {
+                    System.out.println("[Ghidra] Processed " + funcCount + " functions" +
+                        (decompile ? " (" + decompiled + " decompiled)" : "") + "...");
                 }
+            }
+
+            if (decompile) {
+                System.out.println("[Ghidra] Decompiled " + decompiled + " of " + funcCount + " functions");
             }
 
             // Get all defined strings
@@ -223,6 +257,13 @@ public class GhidraAnalyzer {
             result.errors.add("Analysis error: " + e.getMessage());
             e.printStackTrace();
         } finally {
+            if (decompiler != null) {
+                try {
+                    decompiler.dispose();
+                } catch (Exception e) {
+                    // Ignore close errors
+                }
+            }
             if (project != null) {
                 try {
                     project.close();
@@ -233,6 +274,74 @@ public class GhidraAnalyzer {
         }
 
         return result;
+    }
+
+    /**
+     * Analyze a binary file without decompilation (faster).
+     */
+    public AnalysisResult analyzeFile(File binaryFile) throws Exception {
+        return analyzeFile(binaryFile, false);
+    }
+
+    /**
+     * Save decompiled functions to individual files.
+     * @param result The analysis result with decompiled code
+     * @param outputDir Directory to save decompiled files
+     * @param libName Name of the library (for path construction)
+     * @return Number of files saved
+     */
+    public int saveDecompiledFunctions(AnalysisResult result, File outputDir, String libName) throws Exception {
+        // Create directory structure: decompiled/{libName}/
+        File decompDir = new File(outputDir, "decompiled/" + libName);
+        decompDir.mkdirs();
+
+        int saved = 0;
+        for (FunctionInfo func : result.functions) {
+            if (func.decompiledCode != null && !func.decompiledCode.isEmpty()) {
+                // Sanitize function name for filename
+                String safeName = sanitizeFileName(func.name);
+                String fileName = safeName + "_" + func.address.replace(":", "_") + ".c";
+                File funcFile = new File(decompDir, fileName);
+
+                try (PrintWriter writer = new PrintWriter(new FileWriter(funcFile))) {
+                    // Write header comment
+                    writer.println("/*");
+                    writer.println(" * Function: " + func.name);
+                    writer.println(" * Address:  " + func.address);
+                    writer.println(" * Signature: " + func.signature);
+                    writer.println(" * Size: " + func.bodySize + " bytes");
+                    if (!func.calledFunctions.isEmpty()) {
+                        writer.println(" * Calls: " + String.join(", ", func.calledFunctions));
+                    }
+                    writer.println(" */");
+                    writer.println();
+                    writer.println(func.decompiledCode);
+                }
+
+                // Store relative path
+                func.decompiledPath = "decompiled/" + libName + "/" + fileName;
+                saved++;
+            }
+        }
+
+        if (saved > 0) {
+            System.out.println("[Ghidra] Saved " + saved + " decompiled functions to " + decompDir.getAbsolutePath());
+        }
+
+        return saved;
+    }
+
+    /**
+     * Sanitize a function name for use as a filename.
+     */
+    private String sanitizeFileName(String name) {
+        // Replace characters that are invalid in filenames
+        String safe = name.replaceAll("[<>:\"/\\\\|?*]", "_");
+        // Limit length
+        if (safe.length() > 100) {
+            safe = safe.substring(0, 100);
+        }
+        return safe;
     }
 
     /**
@@ -384,6 +493,8 @@ public class GhidraAnalyzer {
         public boolean isExternal;
         public long bodySize;
         public List<String> calledFunctions = new ArrayList<>();
+        public String decompiledCode;  // The actual decompiled C pseudocode
+        public String decompiledPath;  // Relative path to saved file
     }
 
     public static class MemorySection {

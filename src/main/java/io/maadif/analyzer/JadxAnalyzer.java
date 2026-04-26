@@ -3,6 +3,8 @@ package io.maadif.analyzer;
 import jadx.api.*;
 import jadx.core.dex.nodes.*;
 import jadx.core.dex.info.*;
+import jadx.core.dex.instructions.*;
+import jadx.core.dex.instructions.args.*;
 
 import java.io.*;
 import java.nio.file.*;
@@ -77,6 +79,12 @@ public class JadxAnalyzer {
 
             System.out.println("[JADX] Memory after metadata: " + getMemoryUsage());
 
+            // Phase 1.5: Extract method call graph from DEX bytecode
+            System.out.println("[JADX] Phase 1.5: Extracting method call graph...");
+            extractMethodCalls(classes, result);
+
+            System.out.println("[JADX] Memory after call graph: " + getMemoryUsage());
+
             // Phase 2: Analyze resources (manifest, etc.)
             System.out.println("[JADX] Phase 2: Analyzing resources...");
             analyzeResources(jadx, result);
@@ -91,6 +99,10 @@ public class JadxAnalyzer {
             // Phase 4: Security analysis on saved files (streamed, memory efficient)
             System.out.println("[JADX] Phase 4: Security analysis on saved sources...");
             performSecurityAnalysisOnFiles(result);
+
+            // Phase 5: Check for decompilation errors in saved files
+            System.out.println("[JADX] Phase 5: Checking for decompilation errors...");
+            checkDecompilationErrors(result);
 
             result.success = true;
 
@@ -147,7 +159,7 @@ public class JadxAnalyzer {
                     result.storageClasses.add(className);
                 }
 
-                // Get method names (from DEX metadata, no decompilation)
+                // Get method names and check for decompilation issues
                 for (JavaMethod method : cls.getMethods()) {
                     MethodInfo methodInfo = new MethodInfo();
                     methodInfo.name = method.getName();
@@ -156,6 +168,7 @@ public class JadxAnalyzer {
                     } catch (Exception e) {
                         methodInfo.signature = method.getName();
                     }
+
                     classInfo.methods.add(methodInfo);
                 }
 
@@ -247,6 +260,27 @@ public class JadxAnalyzer {
 
             if (manifest != null && !manifest.isEmpty()) {
                 result.manifestContent = manifest;
+
+                // Extract package name from manifest (more reliable)
+                Pattern pkgPattern = Pattern.compile("package=\"([^\"]+)\"");
+                Matcher pkgMatcher = pkgPattern.matcher(manifest);
+                if (pkgMatcher.find()) {
+                    result.packageName = pkgMatcher.group(1);
+                }
+
+                // Extract version name
+                Pattern versionNamePattern = Pattern.compile("android:versionName=\"([^\"]+)\"");
+                Matcher versionNameMatcher = versionNamePattern.matcher(manifest);
+                if (versionNameMatcher.find()) {
+                    result.versionName = versionNameMatcher.group(1);
+                }
+
+                // Extract version code
+                Pattern versionCodePattern = Pattern.compile("android:versionCode=\"([^\"]+)\"");
+                Matcher versionCodeMatcher = versionCodePattern.matcher(manifest);
+                if (versionCodeMatcher.find()) {
+                    result.versionCode = versionCodeMatcher.group(1);
+                }
 
                 // Extract permissions
                 Pattern permPattern = Pattern.compile("android:name=\"(android\\.permission\\.[^\"]+)\"");
@@ -343,6 +377,244 @@ public class JadxAnalyzer {
         long used = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
         long max = rt.maxMemory() / (1024 * 1024);
         return used + "MB / " + max + "MB";
+    }
+
+    /**
+     * Extract method call graph from loaded classes.
+     * This extracts caller->callee relationships from DEX bytecode.
+     */
+    private void extractMethodCalls(List<JavaClass> classes, DecompilationResult result) {
+        AtomicInteger processed = new AtomicInteger(0);
+        AtomicInteger callCount = new AtomicInteger(0);
+        int total = classes.size();
+
+        // Limit total calls to avoid memory issues on huge APKs
+        final int MAX_CALLS = 500000;
+
+        for (JavaClass cls : classes) {
+            if (callCount.get() >= MAX_CALLS) {
+                System.out.println("[JADX] Reached max call limit (" + MAX_CALLS + "), stopping extraction");
+                break;
+            }
+
+            try {
+                String callerClass = cls.getFullName();
+
+                for (JavaMethod method : cls.getMethods()) {
+                    if (callCount.get() >= MAX_CALLS) break;
+
+                    try {
+                        MethodNode methodNode = method.getMethodNode();
+                        if (methodNode == null) continue;
+                        if (methodNode.isNoCode()) continue;
+
+                        // Load method instructions (they are loaded lazily)
+                        try {
+                            methodNode.load();
+                        } catch (Exception e) {
+                            continue; // Skip methods that fail to load
+                        }
+
+                        String callerMethod = method.getName();
+                        String callerSignature = null;
+                        try {
+                            callerSignature = methodNode.getMethodInfo().getShortId();
+                        } catch (Exception e) {
+                            callerSignature = callerMethod;
+                        }
+
+                        // Get instructions and find invoke nodes
+                        InsnNode[] instructions = methodNode.getInstructions();
+                        if (instructions == null || instructions.length == 0) continue;
+
+                        for (InsnNode insn : instructions) {
+                            if (callCount.get() >= MAX_CALLS) break;
+
+                            if (insn instanceof InvokeNode) {
+                                InvokeNode invoke = (InvokeNode) insn;
+                                try {
+                                    jadx.core.dex.info.MethodInfo callMth = invoke.getCallMth();
+                                    if (callMth != null) {
+                                        String calleeClass = callMth.getDeclClass().getFullName();
+                                        String calleeMethod = callMth.getName();
+                                        String calleeSignature = callMth.getShortId();
+
+                                        // Skip standard library calls to reduce noise (optional)
+                                        // Uncomment if you want to filter these out:
+                                        // if (calleeClass.startsWith("java.") || calleeClass.startsWith("android.")) continue;
+
+                                        MethodCall call = new MethodCall(
+                                            callerClass, callerMethod, callerSignature,
+                                            calleeClass, calleeMethod, calleeSignature
+                                        );
+                                        result.methodCalls.add(call);
+                                        callCount.incrementAndGet();
+                                    }
+                                } catch (Exception e) {
+                                    // Skip problematic invoke
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        // Skip problematic method
+                    }
+                }
+
+                // Progress logging
+                int count = processed.incrementAndGet();
+                if (count % 5000 == 0) {
+                    System.out.println("[JADX] Call graph progress: " + count + "/" + total +
+                                     " classes, " + callCount.get() + " calls found");
+                    if (count % 10000 == 0) {
+                        System.gc();
+                    }
+                }
+
+            } catch (Exception e) {
+                // Skip problematic classes
+            }
+        }
+
+        System.out.println("[JADX] Extracted " + result.methodCalls.size() + " method calls from " +
+                         processed.get() + " classes");
+    }
+
+    /**
+     * Check decompiled files for error comments indicating failed decompilation.
+     * Updates the ClassInfo/MethodInfo objects with failure flags.
+     */
+    private void checkDecompilationErrors(DecompilationResult result) {
+        File sourcesDir = new File(outputDir, "jadx_output/sources");
+        if (!sourcesDir.exists()) {
+            return;
+        }
+
+        // Create a map for quick lookup
+        Map<String, ClassInfo> classMap = new HashMap<>();
+        for (ClassInfo cls : result.classes) {
+            classMap.put(cls.fullName, cls);
+        }
+
+        int failedClasses = 0;
+        int failedMethods = 0;
+
+        try {
+            Files.walk(sourcesDir.toPath())
+                .filter(p -> p.toString().endsWith(".java"))
+                .forEach(javaFile -> {
+                    try {
+                        checkFileForErrors(javaFile.toFile(), classMap);
+                    } catch (Exception e) {
+                        // Ignore
+                    }
+                });
+
+            // Count failures
+            for (ClassInfo cls : result.classes) {
+                if (cls.decompileFailed) {
+                    failedClasses++;
+                }
+                for (MethodInfo method : cls.methods) {
+                    if (method.decompileFailed) {
+                        failedMethods++;
+                    }
+                }
+            }
+
+            System.out.println("[JADX] Decompilation errors: " + failedClasses + " classes, " +
+                             failedMethods + " methods failed");
+
+        } catch (Exception e) {
+            result.errors.add("Error checking decompilation status: " + e.getMessage());
+        }
+    }
+
+    private void checkFileForErrors(File javaFile, Map<String, ClassInfo> classMap) throws Exception {
+        String content = Files.readString(javaFile.toPath());
+
+        // Extract class name from file path and content
+        String className = extractClassNameFromFile(javaFile, content);
+        ClassInfo classInfo = classMap.get(className);
+
+        if (classInfo == null) {
+            // Try variations
+            for (String key : classMap.keySet()) {
+                if (key.endsWith("." + javaFile.getName().replace(".java", ""))) {
+                    classInfo = classMap.get(key);
+                    break;
+                }
+            }
+        }
+
+        if (classInfo == null) return;
+
+        // Check for class-level errors
+        if (content.contains("/* JADX ERROR:") ||
+            content.contains("/* JADX WARN: Code restructure failed")) {
+            classInfo.decompileFailed = true;
+            // Extract first error message
+            int idx = content.indexOf("/* JADX");
+            if (idx >= 0) {
+                int endIdx = content.indexOf("*/", idx);
+                if (endIdx > idx && endIdx - idx < 500) {
+                    classInfo.errorMessage = content.substring(idx + 3, endIdx).trim();
+                }
+            }
+        }
+
+        // Check for method-level errors
+        // Pattern: /* JADX WARN: ... */ in method bodies
+        Pattern methodErrorPattern = Pattern.compile(
+            "/\\*\\s*JADX\\s*(WARN|ERROR)[^*]*\\*/",
+            Pattern.CASE_INSENSITIVE);
+        Matcher matcher = methodErrorPattern.matcher(content);
+
+        Set<String> methodsWithErrors = new HashSet<>();
+        while (matcher.find()) {
+            String errorComment = matcher.group();
+
+            // Try to find which method this belongs to
+            // Look backwards for method signature
+            int pos = matcher.start();
+            String before = content.substring(Math.max(0, pos - 500), pos);
+            Pattern methodSigPattern = Pattern.compile(
+                "(public|private|protected)?\\s*(static)?\\s*\\w+\\s+(\\w+)\\s*\\([^)]*\\)\\s*\\{?",
+                Pattern.MULTILINE);
+            Matcher sigMatcher = methodSigPattern.matcher(before);
+            String lastMethod = null;
+            while (sigMatcher.find()) {
+                lastMethod = sigMatcher.group(3);
+            }
+
+            if (lastMethod != null) {
+                methodsWithErrors.add(lastMethod);
+            }
+        }
+
+        // Mark methods as failed
+        for (MethodInfo method : classInfo.methods) {
+            if (methodsWithErrors.contains(method.name)) {
+                method.decompileFailed = true;
+                method.errorMessage = "Decompilation warning/error in method";
+            }
+        }
+    }
+
+    private String extractClassNameFromFile(File javaFile, String content) {
+        // Try to extract from package + class declaration
+        String packageName = "";
+        String className = javaFile.getName().replace(".java", "");
+
+        Pattern pkgPattern = Pattern.compile("package\\s+([\\w.]+)\\s*;");
+        Matcher pkgMatcher = pkgPattern.matcher(content);
+        if (pkgMatcher.find()) {
+            packageName = pkgMatcher.group(1);
+        }
+
+        if (!packageName.isEmpty()) {
+            return packageName + "." + className;
+        }
+        return className;
     }
 
     /**
@@ -491,6 +763,8 @@ public class JadxAnalyzer {
     public static class DecompilationResult {
         public String apkName;
         public String packageName;
+        public String versionName;
+        public String versionCode;
         public String manifestContent;
         public boolean success = false;
         public int totalClasses;
@@ -514,6 +788,9 @@ public class JadxAnalyzer {
         public List<String> storageClasses = new ArrayList<>();
 
         public List<String> errors = new ArrayList<>();
+
+        // Method call graph
+        public List<MethodCall> methodCalls = new ArrayList<>();
     }
 
     public static class ClassInfo {
@@ -521,6 +798,8 @@ public class JadxAnalyzer {
         public String packageName;
         public int accessFlags;
         public int codeSize;
+        public boolean decompileFailed = false;
+        public String errorMessage;
         public List<MethodInfo> methods = new ArrayList<>();
         public List<FieldInfo> fields = new ArrayList<>();
         public List<String> hardcodedStrings = new ArrayList<>();
@@ -533,6 +812,8 @@ public class JadxAnalyzer {
         public String signature;
         public int accessFlags;
         public int codeLines;
+        public boolean decompileFailed = false;
+        public String errorMessage;
     }
 
     public static class FieldInfo {
@@ -544,5 +825,24 @@ public class JadxAnalyzer {
     public static class ResourceInfo {
         public String name;
         public String type;
+    }
+
+    public static class MethodCall {
+        public String callerClass;
+        public String callerMethod;
+        public String callerSignature;
+        public String calleeClass;
+        public String calleeMethod;
+        public String calleeSignature;
+
+        public MethodCall(String callerClass, String callerMethod, String callerSignature,
+                         String calleeClass, String calleeMethod, String calleeSignature) {
+            this.callerClass = callerClass;
+            this.callerMethod = callerMethod;
+            this.callerSignature = callerSignature;
+            this.calleeClass = calleeClass;
+            this.calleeMethod = calleeMethod;
+            this.calleeSignature = calleeSignature;
+        }
     }
 }
