@@ -454,6 +454,30 @@ public class Database {
         return null;
     }
 
+    public List<Map<String, Object>> getJobs(int limit) throws SQLException {
+        String sql = "SELECT id, status, progress, message, options_json, started_at, completed_at, created_at FROM analysis_jobs ORDER BY created_at DESC LIMIT ?";
+        List<Map<String, Object>> jobs = new ArrayList<>();
+
+        try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, limit);
+            ResultSet rs = ps.executeQuery();
+
+            while (rs.next()) {
+                Map<String, Object> job = new HashMap<>();
+                job.put("id", rs.getString("id"));
+                job.put("status", rs.getString("status"));
+                job.put("progress", rs.getInt("progress"));
+                job.put("message", rs.getString("message"));
+                job.put("options_json", rs.getString("options_json"));
+                job.put("started_at", rs.getLong("started_at"));
+                job.put("completed_at", rs.getLong("completed_at"));
+                job.put("created_at", rs.getLong("created_at"));
+                jobs.add(job);
+            }
+        }
+        return jobs;
+    }
+
     // =========================================================================
     // Permissions & Components
     // =========================================================================

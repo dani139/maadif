@@ -44,6 +44,7 @@ export interface AnalysisJob {
   message: string;
   started_at: number | null;
   completed_at: number | null;
+  created_at?: number | null;
 }
 
 export interface ApkInfo {

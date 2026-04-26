@@ -185,9 +185,18 @@ export function VersionTracker({ onNavigateToLibrary }: VersionTrackerProps) {
     mutationFn: async ({ pkg, version }: { pkg: string; version: string }) => {
       // Construct APK path: {package}/{appname}-{version}.xapk or .apk
       const appName = pkg.split('.').pop() || pkg;
+
       // Try xapk first, then apk
-      const apkPath = `${pkg}/${appName}-${version}.xapk`;
-      const job = await startAnalysis(apkPath, { natives: true, decompile: true });
+      let job;
+      try {
+        const xapkPath = `${pkg}/${appName}-${version}.xapk`;
+        job = await startAnalysis(xapkPath, { natives: true, decompile: true });
+      } catch {
+        // If xapk fails, try apk
+        const apkPath = `${pkg}/${appName}-${version}.apk`;
+        job = await startAnalysis(apkPath, { natives: true, decompile: true });
+      }
+
       // Poll for job completion
       let status = job;
       while (status.status === 'pending' || status.status === 'running') {
@@ -199,15 +208,20 @@ export function VersionTracker({ onNavigateToLibrary }: VersionTrackerProps) {
     onMutate: ({ pkg, version }) => {
       setAnalyzingVersions((prev) => new Set(prev).add(`${pkg}-${version}`));
     },
-    onSuccess: ({ version }, { pkg }) => {
+    onSuccess: ({ version, status }, { pkg }) => {
       setAnalyzingVersions((prev) => {
         const next = new Set(prev);
         next.delete(`${pkg}-${version}`);
         return next;
       });
+      if (status.status === 'failed') {
+        setErrorMessages((prev) => [...prev.slice(-4), `Analysis failed for ${pkg} ${version}: ${status.message}`]);
+      }
       queryClient.invalidateQueries({ queryKey: ['versions'] });
     },
-    onError: (_, { pkg, version }) => {
+    onError: (error, { pkg, version }) => {
+      const errorMsg = `Analysis error for ${pkg} ${version}: ${String(error)}`;
+      setErrorMessages((prev) => [...prev.slice(-4), errorMsg]);
       setAnalyzingVersions((prev) => {
         const next = new Set(prev);
         next.delete(`${pkg}-${version}`);

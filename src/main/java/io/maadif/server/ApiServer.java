@@ -72,6 +72,7 @@ public class ApiServer {
         server.createContext("/analyze", this::handleAnalyze);
         server.createContext("/native", this::handleNative);
         server.createContext("/status/", this::handleStatus);
+        server.createContext("/jobs", this::handleJobs);
         server.createContext("/analysis/", this::handleAnalysis);
         server.createContext("/download/versions", this::handleDownloadVersions);
         server.createContext("/download", this::handleDownload);
@@ -838,6 +839,52 @@ public class ApiServer {
                 job.get("completed_at"));
 
             sendJson(exchange, 200, json);
+
+        } catch (Exception e) {
+            sendError(exchange, 500, "Error: " + e.getMessage());
+        }
+    }
+
+    // =========================================================================
+    // List Jobs
+    // =========================================================================
+
+    private void handleJobs(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("GET")) {
+            sendError(exchange, 405, "Method not allowed");
+            return;
+        }
+
+        // Parse limit parameter (default 50)
+        String query = exchange.getRequestURI().getQuery();
+        int limit = 50;
+        try {
+            limit = Integer.parseInt(getQueryParam(query, "limit", "50"));
+            if (limit < 1) limit = 1;
+            if (limit > 200) limit = 200;
+        } catch (NumberFormatException ignored) {}
+
+        try {
+            List<Map<String, Object>> jobs = globalDb.getJobs(limit);
+
+            StringBuilder json = new StringBuilder();
+            json.append("{\"jobs\": [");
+            for (int i = 0; i < jobs.size(); i++) {
+                if (i > 0) json.append(",");
+                Map<String, Object> job = jobs.get(i);
+                json.append(String.format("""
+                    {"id": "%s", "status": "%s", "progress": %d, "message": "%s", "started_at": %s, "completed_at": %s, "created_at": %s}""",
+                    job.get("id"),
+                    job.get("status"),
+                    job.get("progress"),
+                    escape(job.get("message") != null ? job.get("message").toString() : ""),
+                    job.get("started_at"),
+                    job.get("completed_at"),
+                    job.get("created_at")));
+            }
+            json.append("]}");
+
+            sendJson(exchange, 200, json.toString());
 
         } catch (Exception e) {
             sendError(exchange, 500, "Error: " + e.getMessage());

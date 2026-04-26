@@ -13,13 +13,21 @@ import {
   Link,
   Box,
   Code,
+  Play,
 } from 'lucide-react';
-import { getJobStatus, getAnalysisResult, formatTimestamp } from '../api/client';
-import type { AnalysisResult } from '../types';
+import { getJobStatus, getAnalysisResult, listJobs, formatTimestamp, formatRelativeTime } from '../api/client';
+import type { AnalysisResult, AnalysisJob } from '../types';
 
 export function AnalysisJobs() {
   const [jobId, setJobId] = useState('');
   const [searchedJobId, setSearchedJobId] = useState('');
+
+  // Fetch list of all jobs
+  const { data: jobsData, isLoading: jobsLoading, refetch: refetchJobs } = useQuery({
+    queryKey: ['jobs'],
+    queryFn: () => listJobs(50),
+    refetchInterval: 5000, // Poll for updates
+  });
 
   const {
     data: job,
@@ -43,20 +51,72 @@ export function AnalysisJobs() {
     setSearchedJobId(jobId.trim());
   };
 
+  const selectJob = (id: string) => {
+    setJobId(id);
+    setSearchedJobId(id);
+  };
+
+  // Separate jobs by status
+  const runningJobs = jobsData?.jobs?.filter(j => j.status === 'running' || j.status === 'pending') || [];
+  const completedJobs = jobsData?.jobs?.filter(j => j.status === 'completed') || [];
+  const failedJobs = jobsData?.jobs?.filter(j => j.status === 'failed') || [];
+
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div>
-        <h1 className="text-3xl font-bold text-white">Analysis Jobs</h1>
-        <p className="text-slate-400 mt-1">
-          Track and view APK analysis results
-        </p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-bold text-white">Analysis Jobs</h1>
+          <p className="text-slate-400 mt-1">
+            Track and view APK analysis results
+          </p>
+        </div>
+        <button
+          onClick={() => refetchJobs()}
+          className="btn-secondary"
+        >
+          <RefreshCw size={18} className={jobsLoading ? 'animate-spin' : ''} />
+          Refresh
+        </button>
       </div>
 
-      {/* Job Search */}
+      {/* Running Jobs */}
+      {runningJobs.length > 0 && (
+        <div className="card">
+          <h2 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+            <Play size={20} className="text-amber-500" />
+            Running Jobs ({runningJobs.length})
+          </h2>
+          <div className="space-y-3">
+            {runningJobs.map((j) => (
+              <div
+                key={j.id}
+                onClick={() => selectJob(j.id)}
+                className="bg-slate-800/50 rounded-lg p-4 cursor-pointer hover:bg-slate-800 transition-colors"
+              >
+                <div className="flex items-center justify-between mb-2">
+                  <span className="font-mono text-white">{j.id}</span>
+                  <StatusBadge status={j.status} />
+                </div>
+                <div className="h-2 bg-slate-700 rounded-full overflow-hidden mb-2">
+                  <div
+                    className="h-full bg-indigo-500 transition-all duration-500"
+                    style={{ width: `${j.progress || 0}%` }}
+                  />
+                </div>
+                <p className="text-sm text-slate-400 truncate">{j.message || 'Processing...'}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Recent Jobs Table */}
       <div className="card">
-        <h2 className="text-lg font-semibold text-white mb-4">Find Job</h2>
-        <div className="flex gap-3">
+        <h2 className="text-lg font-semibold text-white mb-4">Recent Jobs</h2>
+
+        {/* Job Search */}
+        <div className="flex gap-3 mb-4">
           <div className="relative flex-1">
             <Search
               className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"
@@ -76,6 +136,64 @@ export function AnalysisJobs() {
             Search
           </button>
         </div>
+
+        {jobsLoading ? (
+          <div className="text-center py-8">
+            <RefreshCw className="animate-spin text-slate-400 mx-auto mb-2" size={24} />
+            <p className="text-slate-500">Loading jobs...</p>
+          </div>
+        ) : (jobsData?.jobs?.length ?? 0) > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-slate-800/50">
+                <tr>
+                  <th className="table-header">Job ID</th>
+                  <th className="table-header">Status</th>
+                  <th className="table-header">Progress</th>
+                  <th className="table-header">Message</th>
+                  <th className="table-header">Created</th>
+                </tr>
+              </thead>
+              <tbody>
+                {jobsData?.jobs?.map((j) => (
+                  <tr
+                    key={j.id}
+                    onClick={() => selectJob(j.id)}
+                    className={`table-row cursor-pointer ${searchedJobId === j.id ? 'bg-indigo-500/10' : ''}`}
+                  >
+                    <td className="table-cell">
+                      <span className="font-mono text-white">{j.id}</span>
+                    </td>
+                    <td className="table-cell">
+                      <StatusBadge status={j.status} />
+                    </td>
+                    <td className="table-cell">
+                      <span className="text-slate-300">{j.progress}%</span>
+                    </td>
+                    <td className="table-cell">
+                      <span className="text-slate-400 text-sm truncate max-w-xs block">
+                        {j.message || '-'}
+                      </span>
+                    </td>
+                    <td className="table-cell">
+                      <span className="text-slate-400 text-sm">
+                        {j.created_at ? formatRelativeTime(j.created_at) : '-'}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="text-center py-8">
+            <FileCode className="text-slate-600 mx-auto mb-2" size={32} />
+            <p className="text-slate-500">No analysis jobs yet</p>
+            <p className="text-slate-600 text-sm mt-1">
+              Start an analysis from the APK Library or Version Tracker
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Job Status */}

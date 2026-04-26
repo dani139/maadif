@@ -97,6 +97,11 @@ export async function getDownloadVersions(
 // Analysis
 // ============================================================================
 
+export async function listJobs(limit: number = 50): Promise<{ jobs: AnalysisJob[] }> {
+  const { data } = await api.get('/jobs', { params: { limit } });
+  return data;
+}
+
 export async function startAnalysis(
   apkPath: string,
   options: { natives?: boolean; decompile?: boolean } = {}
