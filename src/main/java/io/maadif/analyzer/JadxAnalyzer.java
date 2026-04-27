@@ -58,13 +58,17 @@ public class JadxAnalyzer {
         System.out.println("[JADX] Analyzing: " + apkFile.getName());
         System.out.println("[JADX] Memory before: " + getMemoryUsage());
 
+        long totalStart = System.currentTimeMillis();
         DecompilationResult result = new DecompilationResult();
         result.apkName = apkFile.getName();
 
         jadxArgs.setInputFile(apkFile);
 
         try (JadxDecompiler jadx = new JadxDecompiler(jadxArgs)) {
+            // Load phase timing
+            long loadStart = System.currentTimeMillis();
             jadx.load();
+            result.loadTimeMs = System.currentTimeMillis() - loadStart;
 
             // Extract package info
             result.packageName = extractPackageName(jadx);
@@ -73,10 +77,11 @@ public class JadxAnalyzer {
             List<JavaClass> classes = jadx.getClasses();
             result.totalClasses = classes.size();
 
-            System.out.println("[JADX] Found " + classes.size() + " classes");
+            System.out.println("[JADX] Found " + classes.size() + " classes (loaded in " + result.loadTimeMs + " ms)");
             System.out.println("[JADX] Memory after load: " + getMemoryUsage());
 
             // Phase 1: Extract metadata WITHOUT triggering full decompilation
+            long metadataStart = System.currentTimeMillis();
             System.out.println("[JADX] Phase 1: Extracting metadata (no decompilation)...");
             extractMetadataOnly(classes, result);
 
@@ -91,21 +96,28 @@ public class JadxAnalyzer {
             // Phase 2: Analyze resources (manifest, etc.)
             System.out.println("[JADX] Phase 2: Analyzing resources...");
             analyzeResources(jadx, result);
+            result.metadataTimeMs = System.currentTimeMillis() - metadataStart;
+            System.out.println("[JADX] Metadata extraction completed in " + result.metadataTimeMs + " ms");
 
             // Phase 3: Save decompiled sources (JADX handles memory internally)
+            long decompileStart = System.currentTimeMillis();
             System.out.println("[JADX] Phase 3: Saving decompiled sources...");
             System.out.println("[JADX] This may take a while for large APKs...");
             jadx.save();
+            result.decompileTimeMs = System.currentTimeMillis() - decompileStart;
 
+            System.out.println("[JADX] Decompilation completed in " + result.decompileTimeMs + " ms");
             System.out.println("[JADX] Memory after save: " + getMemoryUsage());
 
             // Phase 4: Security analysis on saved files (streamed, memory efficient)
+            long securityStart = System.currentTimeMillis();
             System.out.println("[JADX] Phase 4: Security analysis on saved sources...");
             performSecurityAnalysisOnFiles(result);
 
             // Phase 5: Check for decompilation errors in saved files
             System.out.println("[JADX] Phase 5: Checking for decompilation errors...");
             checkDecompilationErrors(result);
+            result.securityScanTimeMs = System.currentTimeMillis() - securityStart;
 
             result.success = true;
 
@@ -114,6 +126,8 @@ public class JadxAnalyzer {
             e.printStackTrace();
         }
 
+        result.totalTimeMs = System.currentTimeMillis() - totalStart;
+        System.out.println("[JADX] Total analysis time: " + result.totalTimeMs + " ms");
         return result;
     }
 
@@ -1061,6 +1075,13 @@ public class JadxAnalyzer {
 
         // Method call graph
         public List<MethodCall> methodCalls = new ArrayList<>();
+
+        // Timing breakdown (milliseconds)
+        public long loadTimeMs = 0;           // Time to load APK into JADX
+        public long metadataTimeMs = 0;       // Time for metadata extraction (Phase 1)
+        public long decompileTimeMs = 0;      // Time for source decompilation (Phase 2)
+        public long securityScanTimeMs = 0;   // Time for security scanning
+        public long totalTimeMs = 0;          // Total analysis time
     }
 
     public static class ClassInfo {

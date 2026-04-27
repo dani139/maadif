@@ -277,6 +277,13 @@ public class ApiServer {
         long totalTimingId = 0;
         File extractedApk = null;
         File xapkTempDir = null;
+
+        // Track timing in memory until database is ready
+        long totalStartTime = System.currentTimeMillis();
+        long xapkStartTime = 0, xapkEndTime = 0;
+        long jadxStartTime = 0, jadxEndTime = 0;
+        long fileCopyStartTime = 0, fileCopyEndTime = 0;
+
         try {
             globalDb.updateJobStatus(jobId, "running", 0, "Starting analysis...");
 
@@ -284,8 +291,10 @@ public class ApiServer {
             File fileToAnalyze = apkFile;
             if (apkFile.getName().toLowerCase().endsWith(".xapk")) {
                 globalDb.updateJobStatus(jobId, "running", 5, "Extracting XAPK...");
+                xapkStartTime = System.currentTimeMillis();
                 xapkTempDir = new File(OUTPUT_DIR, jobId + "_xapk_temp");
                 extractedApk = extractXapk(apkFile, xapkTempDir);
+                xapkEndTime = System.currentTimeMillis();
                 if (extractedApk != null && extractedApk.exists()) {
                     fileToAnalyze = extractedApk;
                     System.out.println("[XAPK] Extracted base.apk: " + extractedApk.getAbsolutePath());
@@ -296,12 +305,14 @@ public class ApiServer {
 
             // Run JADX analysis first to get package name and version
             globalDb.updateJobStatus(jobId, "running", 10, "Running JADX decompilation...");
+            jadxStartTime = System.currentTimeMillis();
 
             File tempOutputDir = new File(OUTPUT_DIR, jobId);
             tempOutputDir.mkdirs();
 
             JadxAnalyzer jadx = new JadxAnalyzer(tempOutputDir);
             JadxAnalyzer.DecompilationResult jadxResult = jadx.analyzeApk(fileToAnalyze);
+            jadxEndTime = System.currentTimeMillis();
 
             // Extract version from JADX result (or use "unknown")
             String packageName = jadxResult.packageName != null ? jadxResult.packageName : "unknown";
@@ -315,6 +326,7 @@ public class ApiServer {
             File versionDir = Database.getVersionDir(DATA_DIR, packageName, version);
 
             // Copy JADX output to version directory (copy instead of move for cross-filesystem support)
+            fileCopyStartTime = System.currentTimeMillis();
             File jadxOutput = new File(tempOutputDir, "jadx_output");
             File jadxSources = new File(jadxOutput, "sources");
             File jadxResources = new File(jadxOutput, "resources");
@@ -327,17 +339,34 @@ public class ApiServer {
             if (jadxResources.exists()) {
                 copyDirectory(jadxResources, targetResources);
             }
+            fileCopyEndTime = System.currentTimeMillis();
 
-            // Start timing
+            // Start timing and save captured phase times
             totalTimingId = apkDb.startTiming(jobId, "total");
             apkDb.log(jobId, "INFO", "init", "Starting analysis for: " + apkFile.getName());
             apkDb.log(jobId, "INFO", "init", "Database: " + apkDb.getDbPath());
 
-            // Log JADX completion
-            long jadxTimingId = apkDb.startTiming(jobId, "jadx_decompilation");
-            apkDb.endTiming(jadxTimingId, "completed");
-            apkDb.log(jobId, "INFO", "jadx", String.format("JADX completed: %d classes, %d resources",
-                jadxResult.totalClasses, jadxResult.resources.size()));
+            // Save XAPK extraction timing (if applicable)
+            if (xapkStartTime > 0 && xapkEndTime > 0) {
+                apkDb.saveTimingRecord(jobId, "xapk_extraction", xapkStartTime, xapkEndTime, "completed");
+                apkDb.log(jobId, "INFO", "xapk", String.format("XAPK extraction completed in %d ms", xapkEndTime - xapkStartTime));
+            }
+
+            // Save JADX timing breakdown
+            apkDb.saveTimingRecord(jobId, "jadx_total", jadxStartTime, jadxEndTime, "completed");
+            apkDb.saveTimingRecord(jobId, "jadx_load", jadxStartTime, jadxStartTime + jadxResult.loadTimeMs, "completed");
+            apkDb.saveTimingRecord(jobId, "jadx_metadata", jadxStartTime + jadxResult.loadTimeMs,
+                jadxStartTime + jadxResult.loadTimeMs + jadxResult.metadataTimeMs, "completed");
+            apkDb.saveTimingRecord(jobId, "jadx_decompile", jadxEndTime - jadxResult.decompileTimeMs - jadxResult.securityScanTimeMs,
+                jadxEndTime - jadxResult.securityScanTimeMs, "completed");
+            apkDb.saveTimingRecord(jobId, "jadx_security", jadxEndTime - jadxResult.securityScanTimeMs, jadxEndTime, "completed");
+            apkDb.log(jobId, "INFO", "jadx", String.format("JADX completed in %d ms: %d classes, %d resources (load=%dms, meta=%dms, decompile=%dms, security=%dms)",
+                jadxEndTime - jadxStartTime, jadxResult.totalClasses, jadxResult.resources.size(),
+                jadxResult.loadTimeMs, jadxResult.metadataTimeMs, jadxResult.decompileTimeMs, jadxResult.securityScanTimeMs));
+
+            // Save file copy timing
+            apkDb.saveTimingRecord(jobId, "file_copy", fileCopyStartTime, fileCopyEndTime, "completed");
+            apkDb.log(jobId, "INFO", "files", String.format("Files copied in %d ms", fileCopyEndTime - fileCopyStartTime));
 
             // Save to database
             apkDb.log(jobId, "INFO", "database", "Saving results to database...");
@@ -478,14 +507,15 @@ public class ApiServer {
 
                 for (String libPath : arm64Libs) {
                     try {
+                        long libStartTime = System.currentTimeMillis();
                         File libFile = extractFromApk(fileToAnalyze, libPath, workDir);
                         if (libFile != null) {
                             long libSize = libFile.length() / (1024 * 1024); // MB
+                            String libName = libFile.getName();
                             apkDb.log(jobId, "INFO", "ghidra", String.format(
                                 "Analyzing: %s (%d MB)", libPath, libSize));
 
                             // Create separate database for this native library
-                            String libName = libFile.getName();
                             Database nativeDb = Database.forNativeLib(DATA_DIR, packageName, version, libName);
                             nativeDb.initializeNativeSchema();
 
@@ -539,8 +569,12 @@ public class ApiServer {
                                 true, ghidraResult.functions.size(), ghidraResult.strings.size(),
                                 ghidraResult.imports.size(), ghidraResult.exports.size(), relativeDbPath);
 
-                            apkDb.log(jobId, "INFO", "ghidra", String.format("Analyzed %s: %d functions (%d decompiled), db: %s",
-                                libName, ghidraResult.functions.size(), decompiledCount, relativeDbPath));
+                            // Record per-library timing
+                            long libEndTime = System.currentTimeMillis();
+                            apkDb.saveTimingRecord(jobId, "native_lib:" + libName, libStartTime, libEndTime, "completed");
+
+                            apkDb.log(jobId, "INFO", "ghidra", String.format("Analyzed %s in %d ms: %d functions (%d decompiled), db: %s",
+                                libName, libEndTime - libStartTime, ghidraResult.functions.size(), decompiledCount, relativeDbPath));
                             libsAnalyzed++;
                         }
                     } catch (Exception e) {

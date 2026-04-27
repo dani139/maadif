@@ -1226,6 +1226,27 @@ public class Database {
         }
     }
 
+    /**
+     * Save a timing record with pre-captured start/end times.
+     * Useful when timing needs to be recorded before database is available.
+     */
+    public void saveTimingRecord(String jobId, String phase, long startedAt, long endedAt, String status) throws SQLException {
+        String sql = """
+            INSERT INTO process_timing (job_id, phase, started_at, ended_at, duration_ms, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """;
+
+        try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, jobId);
+            ps.setString(2, phase);
+            ps.setLong(3, startedAt);
+            ps.setLong(4, endedAt);
+            ps.setLong(5, endedAt - startedAt);
+            ps.setString(6, status);
+            ps.executeUpdate();
+        }
+    }
+
     public void log(String jobId, String level, String phase, String message) throws SQLException {
         String sql = "INSERT INTO logs (job_id, level, phase, message) VALUES (?, ?, ?, ?)";
 
