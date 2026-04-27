@@ -147,7 +147,7 @@ public class Database {
                 )
             """);
 
-            // Methods with decompilation status
+            // Methods with decompilation status and diffing features
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS methods (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,7 +155,33 @@ public class Database {
                     name TEXT,
                     signature TEXT,
                     decompile_failed INTEGER DEFAULT 0,
-                    error_message TEXT
+                    error_message TEXT,
+
+                    -- Diffing features (for version comparison)
+                    instruction_count INTEGER DEFAULT 0,
+                    register_count INTEGER DEFAULT 0,
+                    return_type TEXT,
+                    param_types TEXT,
+                    param_count INTEGER DEFAULT 0,
+                    signature_shape TEXT,
+                    is_static INTEGER DEFAULT 0,
+                    is_native INTEGER DEFAULT 0,
+                    is_abstract INTEGER DEFAULT 0,
+                    is_synthetic INTEGER DEFAULT 0,
+                    is_constructor INTEGER DEFAULT 0,
+                    callee_count INTEGER DEFAULT 0,
+                    external_call_count INTEGER DEFAULT 0,
+
+                    -- Hashes for matching
+                    normalized_hash TEXT,
+                    api_call_hash TEXT,
+                    string_hash TEXT,
+                    opcode_hash TEXT,
+
+                    -- Raw data (JSON)
+                    api_calls TEXT,
+                    string_literals TEXT,
+                    opcode_histogram TEXT
                 )
             """);
 
@@ -256,6 +282,13 @@ public class Database {
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_timing_job ON process_timing(job_id)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_logs_job ON logs(job_id)");
 
+            // Indexes for diffing/matching
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_methods_normalized_hash ON methods(normalized_hash)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_methods_api_hash ON methods(api_call_hash)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_methods_opcode_hash ON methods(opcode_hash)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_methods_signature_shape ON methods(signature_shape)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_methods_name ON methods(name)");
+
             System.out.println("[Database] Initialized APK schema: " + dbPath);
         }
     }
@@ -285,7 +318,7 @@ public class Database {
                 )
             """);
 
-            // Functions
+            // Functions with diffing features
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS functions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -298,7 +331,28 @@ public class Database {
                     is_thunk INTEGER DEFAULT 0,
                     is_external INTEGER DEFAULT 0,
                     is_export INTEGER DEFAULT 0,
-                    decompiled_path TEXT
+                    decompiled_path TEXT,
+
+                    -- Diffing features (for version comparison)
+                    instruction_count INTEGER DEFAULT 0,
+                    basic_block_count INTEGER DEFAULT 0,
+                    edge_count INTEGER DEFAULT 0,
+                    cyclomatic_complexity INTEGER DEFAULT 0,
+                    callee_count INTEGER DEFAULT 0,
+                    external_call_count INTEGER DEFAULT 0,
+
+                    -- Hashes for matching
+                    mnemonic_hash TEXT,
+                    cfg_hash TEXT,
+                    prime_product TEXT,
+                    kgh_hash TEXT,
+                    import_call_hash TEXT,
+                    string_refs_hash TEXT,
+
+                    -- Raw data (JSON)
+                    import_calls TEXT,
+                    string_refs TEXT,
+                    mnemonic_histogram TEXT
                 )
             """);
 
@@ -364,6 +418,13 @@ public class Database {
             // Indexes
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_functions_name ON functions(name)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_calls_caller ON function_calls(caller_id)");
+
+            // Indexes for diffing/matching
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_functions_mnemonic_hash ON functions(mnemonic_hash)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_functions_cfg_hash ON functions(cfg_hash)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_functions_prime_product ON functions(prime_product)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_functions_kgh_hash ON functions(kgh_hash)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_functions_import_hash ON functions(import_call_hash)");
 
             System.out.println("[Database] Initialized native schema: " + dbPath);
         }
@@ -478,6 +539,15 @@ public class Database {
         return jobs;
     }
 
+    public void markVersionNotAnalyzed(String packageName, String version) throws SQLException {
+        String sql = "UPDATE tracked_versions SET analyzed_at = NULL, analysis_db_path = NULL WHERE package_name = ? AND version_name = ?";
+        try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, packageName);
+            ps.setString(2, version);
+            ps.executeUpdate();
+        }
+    }
+
     // =========================================================================
     // Permissions & Components
     // =========================================================================
@@ -520,8 +590,15 @@ public class Database {
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """;
         String methodSql = """
-            INSERT INTO methods (class_id, name, signature, decompile_failed, error_message)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO methods (
+                class_id, name, signature, decompile_failed, error_message,
+                instruction_count, register_count, return_type, param_types, param_count,
+                signature_shape, is_static, is_native, is_abstract, is_synthetic, is_constructor,
+                callee_count, external_call_count,
+                normalized_hash, api_call_hash, string_hash, opcode_hash,
+                api_calls, string_literals, opcode_histogram
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """;
 
         try (Connection conn = connect()) {
@@ -550,6 +627,33 @@ public class Database {
                         methodPs.setString(3, method.signature);
                         methodPs.setInt(4, method.decompileFailed ? 1 : 0);
                         methodPs.setString(5, method.errorMessage);
+
+                        // Diffing features
+                        methodPs.setInt(6, method.instructionCount);
+                        methodPs.setInt(7, method.registerCount);
+                        methodPs.setString(8, method.returnType);
+                        methodPs.setString(9, method.paramTypes);
+                        methodPs.setInt(10, method.paramCount);
+                        methodPs.setString(11, method.signatureShape);
+                        methodPs.setInt(12, method.isStatic ? 1 : 0);
+                        methodPs.setInt(13, method.isNative ? 1 : 0);
+                        methodPs.setInt(14, method.isAbstract ? 1 : 0);
+                        methodPs.setInt(15, method.isSynthetic ? 1 : 0);
+                        methodPs.setInt(16, method.isConstructor ? 1 : 0);
+                        methodPs.setInt(17, method.calleeCount);
+                        methodPs.setInt(18, method.externalCallCount);
+
+                        // Hashes
+                        methodPs.setString(19, method.normalizedHash);
+                        methodPs.setString(20, method.apiCallHash);
+                        methodPs.setString(21, method.stringHash);
+                        methodPs.setString(22, method.opcodeHash);
+
+                        // Raw data (JSON)
+                        methodPs.setString(23, method.apiCalls);
+                        methodPs.setString(24, method.stringLiterals);
+                        methodPs.setString(25, method.opcodeHistogram);
+
                         methodPs.addBatch();
                     }
 
@@ -889,6 +993,139 @@ public class Database {
         saveFunction(name, address, signature, null, 0, 0, false, false, isExport);
     }
 
+    /**
+     * Save function with all diffing features.
+     */
+    public long saveFunctionWithFeatures(FunctionData func) throws SQLException {
+        String sql = """
+            INSERT OR IGNORE INTO functions (
+                name, address, signature, calling_convention, parameter_count, body_size,
+                is_thunk, is_external, is_export, decompiled_path,
+                instruction_count, basic_block_count, edge_count, cyclomatic_complexity,
+                callee_count, external_call_count,
+                mnemonic_hash, cfg_hash, prime_product, kgh_hash, import_call_hash, string_refs_hash,
+                import_calls, string_refs, mnemonic_histogram
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """;
+
+        try (Connection conn = connect();
+             PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            ps.setString(1, func.name);
+            ps.setString(2, func.address);
+            ps.setString(3, func.signature);
+            ps.setString(4, func.callingConvention);
+            ps.setInt(5, func.parameterCount);
+            ps.setLong(6, func.bodySize);
+            ps.setInt(7, func.isThunk ? 1 : 0);
+            ps.setInt(8, func.isExternal ? 1 : 0);
+            ps.setInt(9, func.isExport ? 1 : 0);
+            ps.setString(10, func.decompiledPath);
+
+            // Diffing features
+            ps.setInt(11, func.instructionCount);
+            ps.setInt(12, func.basicBlockCount);
+            ps.setInt(13, func.edgeCount);
+            ps.setInt(14, func.cyclomaticComplexity);
+            ps.setInt(15, func.calleeCount);
+            ps.setInt(16, func.externalCallCount);
+
+            // Hashes
+            ps.setString(17, func.mnemonicHash);
+            ps.setString(18, func.cfgHash);
+            ps.setString(19, func.primeProduct);
+            ps.setString(20, func.kghHash);
+            ps.setString(21, func.importCallHash);
+            ps.setString(22, func.stringRefsHash);
+
+            // Raw data (JSON)
+            ps.setString(23, func.importCalls);
+            ps.setString(24, func.stringRefs);
+            ps.setString(25, func.mnemonicHistogram);
+
+            ps.executeUpdate();
+
+            ResultSet keys = ps.getGeneratedKeys();
+            return keys.next() ? keys.getLong(1) : -1;
+        }
+    }
+
+    /**
+     * Save functions in batch with all diffing features.
+     */
+    public void saveFunctionsBatch(List<FunctionData> functions) throws SQLException {
+        if (functions == null || functions.isEmpty()) return;
+
+        String sql = """
+            INSERT OR IGNORE INTO functions (
+                name, address, signature, calling_convention, parameter_count, body_size,
+                is_thunk, is_external, is_export, decompiled_path,
+                instruction_count, basic_block_count, edge_count, cyclomatic_complexity,
+                callee_count, external_call_count,
+                mnemonic_hash, cfg_hash, prime_product, kgh_hash, import_call_hash, string_refs_hash,
+                import_calls, string_refs, mnemonic_histogram
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """;
+
+        try (Connection conn = connect()) {
+            conn.setAutoCommit(false);
+
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                int count = 0;
+                for (FunctionData func : functions) {
+                    ps.setString(1, func.name);
+                    ps.setString(2, func.address);
+                    ps.setString(3, func.signature);
+                    ps.setString(4, func.callingConvention);
+                    ps.setInt(5, func.parameterCount);
+                    ps.setLong(6, func.bodySize);
+                    ps.setInt(7, func.isThunk ? 1 : 0);
+                    ps.setInt(8, func.isExternal ? 1 : 0);
+                    ps.setInt(9, func.isExport ? 1 : 0);
+                    ps.setString(10, func.decompiledPath);
+
+                    // Diffing features
+                    ps.setInt(11, func.instructionCount);
+                    ps.setInt(12, func.basicBlockCount);
+                    ps.setInt(13, func.edgeCount);
+                    ps.setInt(14, func.cyclomaticComplexity);
+                    ps.setInt(15, func.calleeCount);
+                    ps.setInt(16, func.externalCallCount);
+
+                    // Hashes
+                    ps.setString(17, func.mnemonicHash);
+                    ps.setString(18, func.cfgHash);
+                    ps.setString(19, func.primeProduct);
+                    ps.setString(20, func.kghHash);
+                    ps.setString(21, func.importCallHash);
+                    ps.setString(22, func.stringRefsHash);
+
+                    // Raw data (JSON)
+                    ps.setString(23, func.importCalls);
+                    ps.setString(24, func.stringRefs);
+                    ps.setString(25, func.mnemonicHistogram);
+
+                    ps.addBatch();
+                    count++;
+
+                    if (count % 500 == 0) {
+                        ps.executeBatch();
+                        conn.commit();
+                        System.out.println("[Database] Saved " + count + "/" + functions.size() + " functions");
+                    }
+                }
+
+                ps.executeBatch();
+                conn.commit();
+                System.out.println("[Database] Saved all " + functions.size() + " functions");
+            } catch (Exception e) {
+                conn.rollback();
+                throw e;
+            }
+        }
+    }
+
     // =========================================================================
     // Security & URLs
     // =========================================================================
@@ -1033,6 +1270,26 @@ public class Database {
         return null;
     }
 
+    // Alias for getAnalysisSummary with different field names
+    public Map<String, Object> getAnalysisStats() throws SQLException {
+        Map<String, Object> summary = getAnalysisSummary();
+        if (summary == null) {
+            summary = new HashMap<>();
+            summary.put("class_count", 0);
+            summary.put("method_count", 0);
+            summary.put("failed_classes", 0);
+            summary.put("failed_methods", 0);
+            return summary;
+        }
+        // Rename fields to match expected format
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("class_count", summary.getOrDefault("total_classes", 0));
+        stats.put("method_count", summary.getOrDefault("total_methods", 0));
+        stats.put("failed_classes", summary.getOrDefault("failed_classes", 0));
+        stats.put("failed_methods", summary.getOrDefault("failed_methods", 0));
+        return stats;
+    }
+
     public List<Map<String, Object>> getNativeLibs() throws SQLException {
         return queryListNoParam("SELECT * FROM native_libs ORDER BY path");
     }
@@ -1062,7 +1319,7 @@ public class Database {
         result.put("permissions", getPermissions());
         result.put("components", getComponents());
         result.put("native_libs", getNativeLibs());
-        result.put("security_findings", getSecurityFindings());
+        result.put("security_findings", new ArrayList<>());  // Security findings removed
 
         return result;
     }
@@ -1210,6 +1467,32 @@ public class Database {
         public String signature;
         public boolean decompileFailed;
         public String errorMessage;
+
+        // Diffing features
+        public int instructionCount;
+        public int registerCount;
+        public String returnType;
+        public String paramTypes;        // JSON array
+        public int paramCount;
+        public String signatureShape;
+        public boolean isStatic;
+        public boolean isNative;
+        public boolean isAbstract;
+        public boolean isSynthetic;
+        public boolean isConstructor;
+        public int calleeCount;
+        public int externalCallCount;
+
+        // Hashes for matching
+        public String normalizedHash;
+        public String apiCallHash;
+        public String stringHash;
+        public String opcodeHash;
+
+        // Raw data (JSON)
+        public String apiCalls;          // JSON array
+        public String stringLiterals;    // JSON array
+        public String opcodeHistogram;   // JSON object
     }
 
     public static class MethodCallData {
@@ -1229,5 +1512,42 @@ public class Database {
             this.calleeMethod = calleeMethod;
             this.calleeSignature = calleeSignature;
         }
+    }
+
+    /**
+     * Data class for native function information including diffing features.
+     */
+    public static class FunctionData {
+        public String name;
+        public String address;
+        public String signature;
+        public String callingConvention;
+        public int parameterCount;
+        public long bodySize;
+        public boolean isThunk;
+        public boolean isExternal;
+        public boolean isExport;
+        public String decompiledPath;
+
+        // Diffing features
+        public int instructionCount;
+        public int basicBlockCount;
+        public int edgeCount;
+        public int cyclomaticComplexity;
+        public int calleeCount;
+        public int externalCallCount;
+
+        // Hashes for matching
+        public String mnemonicHash;
+        public String cfgHash;
+        public String primeProduct;
+        public String kghHash;
+        public String importCallHash;
+        public String stringRefsHash;
+
+        // Raw data (JSON)
+        public String importCalls;
+        public String stringRefs;
+        public String mnemonicHistogram;
     }
 }

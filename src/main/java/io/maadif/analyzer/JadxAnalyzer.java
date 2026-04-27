@@ -7,10 +7,13 @@ import jadx.core.dex.instructions.*;
 import jadx.core.dex.instructions.args.*;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.security.MessageDigest;
 import java.util.*;
 import java.util.regex.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 /**
  * JADX-based APK decompiler and analyzer.
@@ -159,7 +162,7 @@ public class JadxAnalyzer {
                     result.storageClasses.add(className);
                 }
 
-                // Get method names and check for decompilation issues
+                // Get method names, signatures, and diffing features
                 for (JavaMethod method : cls.getMethods()) {
                     MethodInfo methodInfo = new MethodInfo();
                     methodInfo.name = method.getName();
@@ -168,6 +171,9 @@ public class JadxAnalyzer {
                     } catch (Exception e) {
                         methodInfo.signature = method.getName();
                     }
+
+                    // Extract diffing features (hashes, API calls, etc.)
+                    extractDiffingFeatures(method, methodInfo);
 
                     classInfo.methods.add(methodInfo);
                 }
@@ -377,6 +383,270 @@ public class JadxAnalyzer {
         long used = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
         long max = rt.maxMemory() / (1024 * 1024);
         return used + "MB / " + max + "MB";
+    }
+
+    // =========================================================================
+    // DIFFING FEATURE EXTRACTION (for version comparison)
+    // =========================================================================
+
+    /**
+     * Extract all diffing-relevant features from a method's bytecode.
+     * Called during metadata extraction for each method.
+     */
+    private void extractDiffingFeatures(JavaMethod method, MethodInfo info) {
+        try {
+            MethodNode methodNode = method.getMethodNode();
+            if (methodNode == null) {
+                return;
+            }
+
+            // Extract signature info (always available)
+            extractSignatureInfo(methodNode, info);
+
+            // Extract flags
+            extractMethodFlags(methodNode, info);
+
+            // Skip methods without code (abstract, native, etc.)
+            if (methodNode.isNoCode()) {
+                return;
+            }
+
+            // Try to load instructions
+            try {
+                methodNode.load();
+            } catch (Exception e) {
+                return; // Can't load bytecode
+            }
+
+            InsnNode[] instructions = methodNode.getInstructions();
+            if (instructions == null || instructions.length == 0) {
+                return;
+            }
+
+            // Extract all features from instructions
+            extractInstructionFeatures(methodNode, instructions, info);
+
+        } catch (Exception e) {
+            // Don't fail the whole analysis if feature extraction fails
+        }
+    }
+
+    /**
+     * Extract method signature information (return type, params).
+     */
+    private void extractSignatureInfo(MethodNode methodNode, MethodInfo info) {
+        try {
+            jadx.core.dex.info.MethodInfo mthInfo = methodNode.getMethodInfo();
+
+            // Return type
+            info.returnType = mthInfo.getReturnType().toString();
+
+            // Parameter types
+            for (ArgType arg : mthInfo.getArgumentsTypes()) {
+                info.paramTypes.add(arg.toString());
+            }
+            info.paramCount = info.paramTypes.size();
+
+            // Signature shape: "(param1,param2)return"
+            info.signatureShape = "(" + String.join(",", info.paramTypes) + ")" + info.returnType;
+
+        } catch (Exception e) {
+            // Ignore
+        }
+    }
+
+    /**
+     * Extract method flags (static, native, abstract, etc.).
+     */
+    private void extractMethodFlags(MethodNode methodNode, MethodInfo info) {
+        try {
+            AccessInfo access = methodNode.getAccessFlags();
+            info.isStatic = access.isStatic();
+            info.isNative = access.isNative();
+            info.isAbstract = access.isAbstract();
+            info.isSynthetic = access.isSynthetic();
+            info.isConstructor = methodNode.isConstructor();
+        } catch (Exception e) {
+            // Ignore
+        }
+    }
+
+    /**
+     * Extract all features from method instructions.
+     * This computes all the hashes needed for diffing.
+     */
+    private void extractInstructionFeatures(MethodNode methodNode, InsnNode[] instructions, MethodInfo info) {
+        info.instructionCount = instructions.length;
+
+        // Track registers for normalization
+        Map<Integer, Integer> registerMap = new HashMap<>();
+        int regCounter = 0;
+
+        // Builders for various hashes
+        StringBuilder normalizedBytecode = new StringBuilder();
+        List<String> opcodes = new ArrayList<>();
+        Set<String> apiCalls = new TreeSet<>();  // TreeSet for sorted order
+        Set<String> strings = new TreeSet<>();
+        Map<String, Integer> opcodeHist = new HashMap<>();
+
+        for (InsnNode insn : instructions) {
+            if (insn == null) continue;
+
+            // 1. OPCODE - add to sequence and histogram
+            String opcode = insn.getType().toString();
+            opcodes.add(opcode);
+            opcodeHist.merge(opcode, 1, Integer::sum);
+
+            // Start normalized bytecode with opcode
+            normalizedBytecode.append(opcode).append(";");
+
+            // 2. NORMALIZE REGISTERS (v0, v1 -> R0, R1 by first use)
+            try {
+                for (InsnArg arg : insn.getArguments()) {
+                    if (arg != null && arg.isRegister()) {
+                        RegisterArg regArg = (RegisterArg) arg;
+                        int regNum = regArg.getRegNum();
+                        if (!registerMap.containsKey(regNum)) {
+                            registerMap.put(regNum, regCounter++);
+                        }
+                        normalizedBytecode.append("R").append(registerMap.get(regNum)).append(",");
+                    }
+                }
+            } catch (Exception e) {
+                // Skip register extraction on error
+            }
+
+            // 3. HANDLE METHOD CALLS (InvokeNode)
+            if (insn instanceof InvokeNode) {
+                try {
+                    InvokeNode invoke = (InvokeNode) insn;
+                    jadx.core.dex.info.MethodInfo callMth = invoke.getCallMth();
+                    if (callMth != null) {
+                        String calleeClass = callMth.getDeclClass().getFullName();
+                        String calleeName = callMth.getName();
+                        info.calleeCount++;
+
+                        if (isExternalApi(calleeClass)) {
+                            // External API call - keep full signature (stable)
+                            String apiCall = calleeClass + "->" + calleeName;
+                            apiCalls.add(apiCall);
+                            info.externalCallCount++;
+                            normalizedBytecode.append("API:").append(callMth.getShortId()).append(";");
+                        } else {
+                            // Internal call - keep only signature shape (obfuscation-resistant)
+                            normalizedBytecode.append("CALL:")
+                                .append(callMth.getReturnType()).append("(");
+                            for (ArgType arg : callMth.getArgumentsTypes()) {
+                                normalizedBytecode.append(arg.toString()).append(",");
+                            }
+                            normalizedBytecode.append(");");
+                        }
+                    }
+                } catch (Exception e) {
+                    // Skip on error
+                }
+            }
+
+            // 4. EXTRACT STRING CONSTANTS
+            if (insn instanceof ConstStringNode) {
+                try {
+                    String str = ((ConstStringNode) insn).getString();
+                    if (str != null && !str.isEmpty()) {
+                        strings.add(str);
+                        // Add hash of string to normalized bytecode (not full string)
+                        normalizedBytecode.append("STR:").append(Integer.toHexString(str.hashCode())).append(";");
+                    }
+                } catch (Exception e) {
+                    // Skip
+                }
+            }
+
+            // 5. HANDLE NUMERIC CONSTANTS (from arguments)
+            try {
+                for (InsnArg arg : insn.getArguments()) {
+                    if (arg != null && arg.isLiteral()) {
+                        LiteralArg lit = (LiteralArg) arg;
+                        normalizedBytecode.append("NUM:").append(lit.getLiteral()).append(";");
+                    }
+                }
+            } catch (Exception e) {
+                // Skip
+            }
+
+            // 6. HANDLE FIELD ACCESS
+            if (insn instanceof IndexInsnNode) {
+                try {
+                    InsnType type = insn.getType();
+                    if (type == InsnType.IGET || type == InsnType.IPUT ||
+                        type == InsnType.SGET || type == InsnType.SPUT) {
+                        Object index = ((IndexInsnNode) insn).getIndex();
+                        if (index instanceof jadx.core.dex.info.FieldInfo) {
+                            jadx.core.dex.info.FieldInfo field = (jadx.core.dex.info.FieldInfo) index;
+                            String fieldClass = field.getDeclClass().getFullName();
+                            if (isExternalApi(fieldClass)) {
+                                normalizedBytecode.append("FAPI:").append(field.getFullId()).append(";");
+                            } else {
+                                normalizedBytecode.append("FIELD:").append(field.getType()).append(";");
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // Skip
+                }
+            }
+        }
+
+        // Record register count
+        info.registerCount = regCounter;
+
+        // Store collected data
+        info.opcodeSequence = opcodes;
+        info.opcodeHistogram = opcodeHist;
+        info.apiCalls = new ArrayList<>(apiCalls);
+        info.stringLiterals = new ArrayList<>(strings);
+
+        // Compute all hashes
+        info.normalizedHash = sha256(normalizedBytecode.toString());
+        info.opcodeHash = sha256(String.join(";", opcodes));
+        info.apiCallHash = sha256(String.join(",", apiCalls));
+        info.stringHash = sha256(String.join(",", strings));
+    }
+
+    /**
+     * Check if a class is an external API (SDK/library that won't be obfuscated).
+     */
+    private boolean isExternalApi(String className) {
+        return className.startsWith("android.") ||
+               className.startsWith("java.") ||
+               className.startsWith("javax.") ||
+               className.startsWith("kotlin.") ||
+               className.startsWith("kotlinx.") ||
+               className.startsWith("com.google.android.") ||
+               className.startsWith("androidx.") ||
+               className.startsWith("dalvik.") ||
+               className.startsWith("org.json.") ||
+               className.startsWith("org.xml.") ||
+               className.startsWith("org.w3c.");
+    }
+
+    /**
+     * Compute SHA-256 hash of a string.
+     */
+    private String sha256(String input) {
+        if (input == null || input.isEmpty()) {
+            return null;
+        }
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (byte b : hash) {
+                hex.append(String.format("%02x", b));
+            }
+            return hex.toString();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**
@@ -814,6 +1084,47 @@ public class JadxAnalyzer {
         public int codeLines;
         public boolean decompileFailed = false;
         public String errorMessage;
+
+        // ============================================
+        // DIFFING FEATURES (for version comparison)
+        // ============================================
+
+        // Basic metrics
+        public int instructionCount = 0;
+        public int registerCount = 0;
+
+        // Signature parts (stable across obfuscation)
+        public String returnType;                    // "V", "I", "Ljava/lang/String;"
+        public List<String> paramTypes = new ArrayList<>();  // ["I", "Ljava/lang/String;"]
+        public int paramCount = 0;
+        public String signatureShape;                // "(ILjava/lang/String;)V"
+
+        // Flags
+        public boolean isStatic = false;
+        public boolean isNative = false;
+        public boolean isAbstract = false;
+        public boolean isSynthetic = false;
+        public boolean isConstructor = false;
+
+        // API calls (VERY STABLE - SDK names don't change with obfuscation)
+        public List<String> apiCalls = new ArrayList<>();    // ["android.util.Log->d", ...]
+        public String apiCallHash;                   // SHA256 of sorted API calls
+
+        // String constants
+        public List<String> stringLiterals = new ArrayList<>();
+        public String stringHash;                    // SHA256 of sorted strings
+
+        // Opcode features
+        public List<String> opcodeSequence = new ArrayList<>();  // ["INVOKE_VIRTUAL", ...]
+        public String opcodeHash;                    // SHA256 of opcode sequence
+        public Map<String, Integer> opcodeHistogram = new HashMap<>();  // {"INVOKE_VIRTUAL": 5}
+
+        // The main matching hash (normalized bytecode)
+        public String normalizedHash;                // SHA256 of normalized bytecode
+
+        // Call graph stats
+        public int calleeCount = 0;                  // Methods this calls (internal + external)
+        public int externalCallCount = 0;            // Only external API calls
     }
 
     public static class FieldInfo {

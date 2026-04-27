@@ -73,6 +73,8 @@ public class ApiServer {
         server.createContext("/native", this::handleNative);
         server.createContext("/status/", this::handleStatus);
         server.createContext("/jobs", this::handleJobs);
+        server.createContext("/analysis/by-path", this::handleAnalysisByPath);
+        server.createContext("/analysis/delete", this::handleAnalysisDelete);
         server.createContext("/analysis/", this::handleAnalysis);
         server.createContext("/download/versions", this::handleDownloadVersions);
         server.createContext("/download", this::handleDownload);
@@ -367,6 +369,33 @@ public class ApiServer {
                     methodData.signature = method.signature;
                     methodData.decompileFailed = method.decompileFailed;
                     methodData.errorMessage = method.errorMessage;
+
+                    // Copy diffing features
+                    methodData.instructionCount = method.instructionCount;
+                    methodData.registerCount = method.registerCount;
+                    methodData.returnType = method.returnType;
+                    methodData.paramTypes = toJson(method.paramTypes);
+                    methodData.paramCount = method.paramCount;
+                    methodData.signatureShape = method.signatureShape;
+                    methodData.isStatic = method.isStatic;
+                    methodData.isNative = method.isNative;
+                    methodData.isAbstract = method.isAbstract;
+                    methodData.isSynthetic = method.isSynthetic;
+                    methodData.isConstructor = method.isConstructor;
+                    methodData.calleeCount = method.calleeCount;
+                    methodData.externalCallCount = method.externalCallCount;
+
+                    // Copy hashes
+                    methodData.normalizedHash = method.normalizedHash;
+                    methodData.apiCallHash = method.apiCallHash;
+                    methodData.stringHash = method.stringHash;
+                    methodData.opcodeHash = method.opcodeHash;
+
+                    // Copy raw data as JSON
+                    methodData.apiCalls = toJson(method.apiCalls);
+                    methodData.stringLiterals = toJson(method.stringLiterals);
+                    methodData.opcodeHistogram = toJson(method.opcodeHistogram);
+
                     classData.methods.add(methodData);
 
                     if (method.decompileFailed) {
@@ -418,13 +447,7 @@ public class ApiServer {
                 apkDb.saveComponent("service", service);
             }
 
-            // Save security findings
-            for (String issue : jadxResult.securityIssues) {
-                apkDb.saveSecurityFinding("security_issue", "medium", issue, null);
-            }
-            for (String secret : jadxResult.potentialSecrets) {
-                apkDb.saveSecurityFinding("potential_secret", "high", secret, null);
-            }
+            // Security findings collection removed
 
             // Save URLs
             Set<String> uniqueUrls = new HashSet<>(jadxResult.allUrls);
@@ -481,13 +504,13 @@ public class ApiServer {
                             // Save decompiled functions to files
                             int decompiledCount = ghidra.saveDecompiledFunctions(ghidraResult, versionDir, libName);
 
-                            // Save functions to native database (with decompiled paths)
+                            // Save functions to native database (with hashing features)
+                            List<Database.FunctionData> funcDataList = new ArrayList<>();
                             for (GhidraAnalyzer.FunctionInfo func : ghidraResult.functions) {
-                                nativeDb.saveFunction(func.name, func.address, func.signature,
-                                    func.callingConvention, func.parameterCount, func.bodySize,
-                                    func.isThunk, func.isExternal, !func.name.startsWith("FUN_"),
-                                    func.decompiledPath);
+                                Database.FunctionData fd = convertFunctionInfo(func);
+                                funcDataList.add(fd);
                             }
+                            nativeDb.saveFunctionsBatch(funcDataList);
 
                             // Save strings to native database
                             for (String str : ghidraResult.strings) {
@@ -713,13 +736,13 @@ public class ApiServer {
             // Save decompiled functions to files
             int decompiledCount = ghidra.saveDecompiledFunctions(result, outputDir, libName);
 
-            // Save functions (with decompiled paths)
+            // Save functions (with hashing features)
+            List<Database.FunctionData> funcDataList = new ArrayList<>();
             for (GhidraAnalyzer.FunctionInfo func : result.functions) {
-                nativeDb.saveFunction(func.name, func.address, func.signature,
-                    func.callingConvention, func.parameterCount, func.bodySize,
-                    func.isThunk, func.isExternal, !func.name.startsWith("FUN_"),
-                    func.decompiledPath);
+                Database.FunctionData fd = convertFunctionInfo(func);
+                funcDataList.add(fd);
             }
+            nativeDb.saveFunctionsBatch(funcDataList);
 
             // Save strings
             for (String str : result.strings) {
@@ -892,6 +915,143 @@ public class ApiServer {
     }
 
     // =========================================================================
+    // Analysis By Package/Version Path
+    // =========================================================================
+
+    private void handleAnalysisByPath(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("GET")) {
+            sendError(exchange, 405, "Method not allowed");
+            return;
+        }
+
+        String query = exchange.getRequestURI().getQuery();
+        String packageName = getQueryParam(query, "package", "");
+        String version = getQueryParam(query, "version", "");
+
+        if (packageName.isEmpty() || version.isEmpty()) {
+            sendError(exchange, 400, "Missing package or version parameter");
+            return;
+        }
+
+        try {
+            // Construct the analysis database path
+            File analysisDb = new File(DATA_DIR, packageName + "/" + version + "/analysis.db");
+
+            if (!analysisDb.exists()) {
+                sendError(exchange, 404, "Analysis not found for " + packageName + " @ " + version);
+                return;
+            }
+
+            // Open the analysis database and read results
+            Database apkDb = new Database(analysisDb.getAbsolutePath());
+            Map<String, Object> stats = apkDb.getAnalysisStats();
+            List<Map<String, Object>> permissions = apkDb.getPermissions();
+            List<Map<String, Object>> components = apkDb.getComponents();
+            List<Map<String, Object>> natives = apkDb.getNativeLibs();
+
+            // Build response JSON
+            StringBuilder json = new StringBuilder();
+            json.append("{\n");
+            json.append("  \"database_path\": \"").append(escape(analysisDb.getAbsolutePath())).append("\",\n");
+            json.append("  \"total_classes\": ").append(stats.getOrDefault("class_count", 0)).append(",\n");
+            json.append("  \"total_methods\": ").append(stats.getOrDefault("method_count", 0)).append(",\n");
+            json.append("  \"failed_classes\": ").append(stats.getOrDefault("failed_classes", 0)).append(",\n");
+            json.append("  \"failed_methods\": ").append(stats.getOrDefault("failed_methods", 0)).append(",\n");
+
+            // Permissions
+            json.append("  \"permissions\": [");
+            for (int i = 0; i < permissions.size(); i++) {
+                if (i > 0) json.append(",");
+                Map<String, Object> p = permissions.get(i);
+                json.append(String.format("{\"permission\":\"%s\"}",
+                    escape(p.get("permission").toString())));
+            }
+            json.append("],\n");
+
+            // Components
+            json.append("  \"components\": [");
+            for (int i = 0; i < Math.min(components.size(), 500); i++) {
+                if (i > 0) json.append(",");
+                Map<String, Object> c = components.get(i);
+                json.append(String.format("{\"type\":\"%s\",\"name\":\"%s\",\"exported\":%s}",
+                    escape(c.get("type").toString()),
+                    escape(c.get("name").toString()),
+                    c.get("exported")));
+            }
+            json.append("],\n");
+
+            // Native libs
+            json.append("  \"native_libs\": [");
+            for (int i = 0; i < natives.size(); i++) {
+                if (i > 0) json.append(",");
+                Map<String, Object> n = natives.get(i);
+                json.append(String.format("{\"path\":\"%s\",\"name\":\"%s\",\"arch\":\"%s\",\"size\":%d,\"analyzed\":%s,\"function_count\":%d,\"string_count\":%d}",
+                    escape(n.get("path").toString()),
+                    escape(n.get("name").toString()),
+                    escape(n.getOrDefault("arch", "unknown").toString()),
+                    ((Number) n.getOrDefault("size", 0)).longValue(),
+                    n.getOrDefault("analyzed", 0),
+                    ((Number) n.getOrDefault("function_count", 0)).intValue(),
+                    ((Number) n.getOrDefault("string_count", 0)).intValue()));
+            }
+            json.append("],\n");
+
+            // Security findings removed
+            json.append("  \"security_findings\": []\n");
+
+            json.append("}");
+
+            sendJson(exchange, 200, json.toString());
+
+        } catch (Exception e) {
+            sendError(exchange, 500, "Error reading analysis: " + e.getMessage());
+        }
+    }
+
+    // =========================================================================
+    // Delete Analysis
+    // =========================================================================
+
+    private void handleAnalysisDelete(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("DELETE") && !exchange.getRequestMethod().equals("POST")) {
+            sendError(exchange, 405, "Method not allowed");
+            return;
+        }
+
+        String query = exchange.getRequestURI().getQuery();
+        String packageName = getQueryParam(query, "package", "");
+        String version = getQueryParam(query, "version", "");
+
+        if (packageName.isEmpty() || version.isEmpty()) {
+            sendError(exchange, 400, "Missing package or version parameter");
+            return;
+        }
+
+        try {
+            File analysisDir = new File(DATA_DIR, packageName + "/" + version);
+
+            if (!analysisDir.exists()) {
+                sendError(exchange, 404, "Analysis not found for " + packageName + " @ " + version);
+                return;
+            }
+
+            // Delete all files in the analysis directory
+            deleteDirectory(analysisDir);
+
+            // Update version tracking to mark as not analyzed
+            globalDb.markVersionNotAnalyzed(packageName, version);
+
+            String json = String.format("{\"status\": \"deleted\", \"package\": \"%s\", \"version\": \"%s\"}",
+                escape(packageName), escape(version));
+
+            sendJson(exchange, 200, json);
+
+        } catch (Exception e) {
+            sendError(exchange, 500, "Error deleting analysis: " + e.getMessage());
+        }
+    }
+
+    // =========================================================================
     // Analysis Results
     // =========================================================================
 
@@ -958,8 +1118,8 @@ public class ApiServer {
                 // Native libs
                 json.append("  \"native_libs\": ").append(toJsonObjectArray((List<?>) analysis.get("native_libs"))).append(",\n");
 
-                // Security findings
-                json.append("  \"security_findings\": ").append(toJsonObjectArray((List<?>) analysis.get("security_findings"))).append(",\n");
+                // Security findings (removed)
+                json.append("  \"security_findings\": [],\n");
 
                 // Timing data
                 List<Map<String, Object>> timings = apkDb.getTimings(jobId);
@@ -1914,6 +2074,48 @@ public class ApiServer {
         return o != null ? o.toString() : "";
     }
 
+    /**
+     * Convert GhidraAnalyzer.FunctionInfo to Database.FunctionData.
+     */
+    private Database.FunctionData convertFunctionInfo(GhidraAnalyzer.FunctionInfo func) {
+        Database.FunctionData fd = new Database.FunctionData();
+
+        // Basic info
+        fd.name = func.name;
+        fd.address = func.address;
+        fd.signature = func.signature;
+        fd.callingConvention = func.callingConvention;
+        fd.parameterCount = func.parameterCount;
+        fd.bodySize = func.bodySize;
+        fd.isThunk = func.isThunk;
+        fd.isExternal = func.isExternal;
+        fd.isExport = func.isExport || !func.name.startsWith("FUN_");
+        fd.decompiledPath = func.decompiledPath;
+
+        // Diffing features
+        fd.instructionCount = func.instructionCount;
+        fd.basicBlockCount = func.basicBlockCount;
+        fd.edgeCount = func.edgeCount;
+        fd.cyclomaticComplexity = func.cyclomaticComplexity;
+        fd.calleeCount = func.calleeCount;
+        fd.externalCallCount = func.externalCallCount;
+
+        // Hashes
+        fd.mnemonicHash = func.mnemonicHash;
+        fd.cfgHash = func.cfgHash;
+        fd.primeProduct = func.primeProduct;
+        fd.kghHash = func.kghHash;
+        fd.importCallHash = func.importCallHash;
+        fd.stringRefsHash = func.stringRefsHash;
+
+        // Raw data (convert to JSON)
+        fd.importCalls = GhidraAnalyzer.toJson(func.importCalls);
+        fd.stringRefs = GhidraAnalyzer.toJson(func.stringRefs);
+        fd.mnemonicHistogram = GhidraAnalyzer.toJson(func.mnemonicHistogram);
+
+        return fd;
+    }
+
     private String toJsonArray(List<?> list, String field) {
         if (list == null || list.isEmpty()) return "[]";
         StringBuilder sb = new StringBuilder("[");
@@ -1950,6 +2152,35 @@ public class ApiServer {
             sb.append("}");
         }
         sb.append("\n  ]");
+        return sb.toString();
+    }
+
+    /**
+     * Convert a List of strings to JSON array.
+     */
+    private String toJson(List<String> list) {
+        if (list == null || list.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("\"").append(escape(list.get(i))).append("\"");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    /**
+     * Convert a Map to JSON object.
+     */
+    private String toJson(Map<String, Integer> map) {
+        if (map == null || map.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder("{");
+        int i = 0;
+        for (Map.Entry<String, Integer> entry : map.entrySet()) {
+            if (i++ > 0) sb.append(",");
+            sb.append("\"").append(escape(entry.getKey())).append("\":").append(entry.getValue());
+        }
+        sb.append("}");
         return sb.toString();
     }
 
