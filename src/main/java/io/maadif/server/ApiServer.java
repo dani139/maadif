@@ -70,6 +70,8 @@ public class ApiServer {
         server.createContext("/health", this::handleHealth);
         server.createContext("/apks", this::handleApks);
         server.createContext("/analyze", this::handleAnalyze);
+        server.createContext("/native/file", this::handleNativeFile);
+        server.createContext("/native/batch", this::handleNativeBatch);
         server.createContext("/native", this::handleNative);
         server.createContext("/status/", this::handleStatus);
         server.createContext("/jobs", this::handleJobs);
@@ -91,6 +93,10 @@ public class ApiServer {
         server.createContext("/releases/subscriptions", this::handleReleasesSubscriptions);
         server.createContext("/releases/history", this::handleReleasesHistory);
         server.createContext("/releases", this::handleReleases);
+
+        // Ghidra full export endpoints
+        server.createContext("/ghidra/export", this::handleGhidraExport);
+        server.createContext("/ghidra/batch", this::handleGhidraBatch);
 
         server.setExecutor(Executors.newFixedThreadPool(4));
     }
@@ -117,7 +123,9 @@ public class ApiServer {
         System.out.println("  GET  /health              - Health check");
         System.out.println("  GET  /apks                - List available APKs");
         System.out.println("  POST /analyze             - Start APK analysis");
-        System.out.println("  POST /native              - Analyze specific native library");
+        System.out.println("  POST /native              - Analyze native library from APK");
+        System.out.println("  POST /native/file         - Analyze .so file directly (path, package, version)");
+        System.out.println("  POST /native/batch        - Analyze all .so files in directory (directory, package, version)");
         System.out.println("  GET  /status/{id}         - Get job status");
         System.out.println("  GET  /analysis/{id}       - Get analysis results");
         System.out.println("  GET  /download/versions   - List available versions (?package=com.app)");
@@ -135,6 +143,10 @@ public class ApiServer {
         System.out.println("  GET  /releases/history    - Get release history from DB");
         System.out.println("  POST /releases/subscribe  - Subscribe to release notifications");
         System.out.println("  GET  /releases/subscriptions - List active subscriptions");
+        System.out.println();
+        System.out.println("Ghidra Full Export:");
+        System.out.println("  POST /ghidra/export       - Export single .so to SQLite (file, output)");
+        System.out.println("  POST /ghidra/batch        - Export all .so files in dir (directory, output)");
         System.out.println();
         System.out.println("Background: Release checker running every 30 minutes");
         System.out.println();
@@ -850,6 +862,583 @@ public class ApiServer {
             }
         } catch (Exception e) {
             System.err.println("[Warning] Failed to copy " + source + " to " + target + ": " + e.getMessage());
+        }
+    }
+
+    // =========================================================================
+    // Analyze Native File Directly (for device-pulled .so files)
+    // =========================================================================
+
+    /**
+     * POST /native/file - Analyze a .so file directly from filesystem
+     * Body: {"path": "/path/to/lib.so", "package": "com.whatsapp", "version": "2.26.16.73"}
+     */
+    private void handleNativeFile(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("POST")) {
+            sendError(exchange, 405, "Method not allowed");
+            return;
+        }
+
+        String body = new String(exchange.getRequestBody().readAllBytes());
+        Map<String, String> params = parseJson(body);
+
+        String filePath = params.get("path");
+        String packageName = params.getOrDefault("package", "unknown");
+        String version = params.getOrDefault("version", "unknown");
+
+        if (filePath == null) {
+            sendError(exchange, 400, "Missing 'path' parameter");
+            return;
+        }
+
+        File soFile = new File(filePath);
+        if (!soFile.exists()) {
+            sendError(exchange, 404, "File not found: " + filePath);
+            return;
+        }
+
+        try {
+            String optionsJson = String.format("{\"file\": \"%s\", \"package\": \"%s\", \"version\": \"%s\"}",
+                escape(filePath), escape(packageName), escape(version));
+            String jobId = globalDb.createJob(soFile.getName(), optionsJson);
+
+            // Start analysis in background
+            analysisExecutor.submit(() -> runNativeFileAnalysis(jobId, soFile, packageName, version));
+
+            String json = String.format("""
+                {
+                  "id": "%s",
+                  "status": "pending",
+                  "message": "Native file analysis started",
+                  "file": "%s"
+                }
+                """, jobId, escape(soFile.getName()));
+
+            sendJson(exchange, 202, json);
+
+        } catch (Exception e) {
+            sendError(exchange, 500, "Failed to create job: " + e.getMessage());
+        }
+    }
+
+    /**
+     * POST /native/batch - Analyze multiple .so files from a directory
+     * Body: {"directory": "/path/to/device_sos", "package": "com.whatsapp", "version": "2.26.16.73"}
+     */
+    private void handleNativeBatch(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("POST")) {
+            sendError(exchange, 405, "Method not allowed");
+            return;
+        }
+
+        String body = new String(exchange.getRequestBody().readAllBytes());
+        Map<String, String> params = parseJson(body);
+
+        String dirPath = params.get("directory");
+        String packageName = params.getOrDefault("package", "com.whatsapp");
+        String version = params.getOrDefault("version", "unknown");
+
+        if (dirPath == null) {
+            sendError(exchange, 400, "Missing 'directory' parameter");
+            return;
+        }
+
+        File soDir = new File(dirPath);
+        if (!soDir.exists() || !soDir.isDirectory()) {
+            sendError(exchange, 404, "Directory not found: " + dirPath);
+            return;
+        }
+
+        // Find all .so files
+        File[] soFiles = soDir.listFiles((dir, name) -> name.endsWith(".so"));
+        if (soFiles == null || soFiles.length == 0) {
+            sendError(exchange, 400, "No .so files found in directory");
+            return;
+        }
+
+        try {
+            String optionsJson = String.format("{\"directory\": \"%s\", \"package\": \"%s\", \"version\": \"%s\", \"count\": %d}",
+                escape(dirPath), escape(packageName), escape(version), soFiles.length);
+            String jobId = globalDb.createJob("batch_" + soFiles.length + "_libs", optionsJson);
+
+            // Start batch analysis in background
+            analysisExecutor.submit(() -> runNativeBatchAnalysis(jobId, soFiles, packageName, version));
+
+            String json = String.format("""
+                {
+                  "id": "%s",
+                  "status": "pending",
+                  "message": "Batch native analysis started",
+                  "file_count": %d
+                }
+                """, jobId, soFiles.length);
+
+            sendJson(exchange, 202, json);
+
+        } catch (Exception e) {
+            sendError(exchange, 500, "Failed to create job: " + e.getMessage());
+        }
+    }
+
+    private void runNativeFileAnalysis(String jobId, File soFile, String packageName, String version) {
+        try {
+            globalDb.updateJobStatus(jobId, "running", 0, "Starting Ghidra analysis...");
+
+            String libName = soFile.getName().replace(".so", "");
+
+            // Output to data/{package}/{version}/natives/{libname}.db
+            File versionDir = new File(DATA_DIR + "/" + packageName + "/" + version);
+            File nativesDir = new File(versionDir, "natives");
+            nativesDir.mkdirs();
+
+            File decompDir = new File(versionDir, "decompiled");
+            decompDir.mkdirs();
+
+            globalDb.updateJobStatus(jobId, "running", 10, "Running Ghidra decompilation on " + soFile.getName() + "...");
+
+            // Run Ghidra analysis with decompilation
+            GhidraAnalyzer ghidra = new GhidraAnalyzer(versionDir);
+            GhidraAnalyzer.AnalysisResult result = ghidra.analyzeFile(soFile, true);
+
+            globalDb.updateJobStatus(jobId, "running", 70, "Saving to database...");
+
+            // Create native database
+            Database nativeDb = Database.forNativeLib(DATA_DIR, packageName, version, libName);
+            nativeDb.initializeNativeSchema();
+
+            // Save lib info
+            nativeDb.saveLibInfo(libName, soFile.getAbsolutePath(), "arm64-v8a", soFile.length(),
+                result.languageId, result.compilerSpec, result.imageBase);
+
+            // Save decompiled functions to .c files
+            int decompiledCount = ghidra.saveDecompiledFunctions(result, versionDir, libName);
+
+            globalDb.updateJobStatus(jobId, "running", 85, "Saving functions to database...");
+
+            // Save functions with hashing features
+            List<Database.FunctionData> funcDataList = new ArrayList<>();
+            for (GhidraAnalyzer.FunctionInfo func : result.functions) {
+                Database.FunctionData fd = convertFunctionInfo(func);
+                funcDataList.add(fd);
+            }
+            nativeDb.saveFunctionsBatch(funcDataList);
+
+            // Save strings
+            for (String str : result.strings) {
+                nativeDb.saveString(str, null);
+            }
+
+            // Save imports
+            for (String imp : result.imports) {
+                nativeDb.saveImport(imp);
+            }
+
+            // Save exports
+            for (String exp : result.exports) {
+                nativeDb.saveExport(exp);
+            }
+
+            // Save memory sections
+            for (GhidraAnalyzer.MemorySection section : result.memorySections) {
+                nativeDb.saveMemorySection(section.name, section.start, section.end,
+                    section.size, section.isRead, section.isWrite, section.isExecute, section.isInitialized);
+            }
+
+            // Generate report
+            File reportFile = new File(nativesDir, libName + "_report.txt");
+            ghidra.generateReport(result, reportFile);
+
+            globalDb.updateJobStatus(jobId, "completed", 100,
+                String.format("Complete: %d functions (%d decompiled), %d strings. DB: %s",
+                    result.functions.size(), decompiledCount, result.strings.size(), nativeDb.getDbPath()));
+
+        } catch (Exception e) {
+            try {
+                globalDb.updateJobStatus(jobId, "failed", 0, "Error: " + e.getMessage());
+            } catch (Exception ignored) {}
+            e.printStackTrace();
+        }
+    }
+
+    private void runNativeBatchAnalysis(String jobId, File[] soFiles, String packageName, String version) {
+        try {
+            int total = soFiles.length;
+            int completed = 0;
+            int failed = 0;
+
+            File versionDir = new File(DATA_DIR + "/" + packageName + "/" + version);
+            File nativesDir = new File(versionDir, "natives");
+            nativesDir.mkdirs();
+
+            for (File soFile : soFiles) {
+                String libName = soFile.getName().replace(".so", "");
+
+                int progress = (completed * 100) / total;
+                globalDb.updateJobStatus(jobId, "running", progress,
+                    String.format("Analyzing %s (%d/%d)...", soFile.getName(), completed + 1, total));
+
+                try {
+                    // Run Ghidra analysis with decompilation
+                    GhidraAnalyzer ghidra = new GhidraAnalyzer(versionDir);
+                    GhidraAnalyzer.AnalysisResult result = ghidra.analyzeFile(soFile, true);
+
+                    // Create native database
+                    Database nativeDb = Database.forNativeLib(DATA_DIR, packageName, version, libName);
+                    nativeDb.initializeNativeSchema();
+
+                    // Save lib info
+                    nativeDb.saveLibInfo(libName, soFile.getAbsolutePath(), "arm64-v8a", soFile.length(),
+                        result.languageId, result.compilerSpec, result.imageBase);
+
+                    // Save decompiled functions
+                    int decompiledCount = ghidra.saveDecompiledFunctions(result, versionDir, libName);
+
+                    // Save functions with hashing features
+                    List<Database.FunctionData> funcDataList = new ArrayList<>();
+                    for (GhidraAnalyzer.FunctionInfo func : result.functions) {
+                        Database.FunctionData fd = convertFunctionInfo(func);
+                        funcDataList.add(fd);
+                    }
+                    nativeDb.saveFunctionsBatch(funcDataList);
+
+                    // Save strings, imports, exports
+                    for (String str : result.strings) nativeDb.saveString(str, null);
+                    for (String imp : result.imports) nativeDb.saveImport(imp);
+                    for (String exp : result.exports) nativeDb.saveExport(exp);
+
+                    // Save memory sections
+                    for (GhidraAnalyzer.MemorySection section : result.memorySections) {
+                        nativeDb.saveMemorySection(section.name, section.start, section.end,
+                            section.size, section.isRead, section.isWrite, section.isExecute, section.isInitialized);
+                    }
+
+                    System.out.println("[Batch] " + libName + ": " + result.functions.size() +
+                        " functions (" + decompiledCount + " decompiled)");
+
+                    completed++;
+
+                } catch (Exception e) {
+                    System.err.println("[Batch] Failed: " + soFile.getName() + " - " + e.getMessage());
+                    failed++;
+                }
+            }
+
+            globalDb.updateJobStatus(jobId, "completed", 100,
+                String.format("Batch complete: %d/%d analyzed, %d failed. Output: %s",
+                    completed, total, failed, versionDir.getAbsolutePath()));
+
+        } catch (Exception e) {
+            try {
+                globalDb.updateJobStatus(jobId, "failed", 0, "Error: " + e.getMessage());
+            } catch (Exception ignored) {}
+            e.printStackTrace();
+        }
+    }
+
+    // =========================================================================
+    // Ghidra Full Export to SQLite
+    // =========================================================================
+
+    /**
+     * POST /ghidra/export - Full Ghidra analysis with decompilation to SQLite
+     * Body: {"file": "/path/to/lib.so", "output": "/output/dir"}
+     */
+    private void handleGhidraExport(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("POST")) {
+            sendError(exchange, 405, "Method not allowed");
+            return;
+        }
+
+        String body = new String(exchange.getRequestBody().readAllBytes());
+        Map<String, String> params = parseJson(body);
+
+        String filePath = params.get("file");
+        String outputPath = params.getOrDefault("output", OUTPUT_DIR + "/ghidra_export");
+
+        if (filePath == null) {
+            sendError(exchange, 400, "Missing 'file' parameter");
+            return;
+        }
+
+        File soFile = new File(filePath);
+        if (!soFile.exists()) {
+            sendError(exchange, 404, "File not found: " + filePath);
+            return;
+        }
+
+        File outputDir = new File(outputPath);
+        outputDir.mkdirs();
+
+        try {
+            String optionsJson = String.format("{\"file\": \"%s\", \"output\": \"%s\"}",
+                escape(filePath), escape(outputPath));
+            String jobId = globalDb.createJob("ghidra_export_" + soFile.getName(), optionsJson);
+
+            // Run export in background
+            analysisExecutor.submit(() -> runGhidraExport(jobId, soFile, outputDir));
+
+            String json = String.format("""
+                {
+                  "id": "%s",
+                  "status": "pending",
+                  "message": "Ghidra export started for %s"
+                }
+                """, jobId, soFile.getName());
+
+            sendJson(exchange, 202, json);
+
+        } catch (Exception e) {
+            sendError(exchange, 500, "Failed to create job: " + e.getMessage());
+        }
+    }
+
+    /**
+     * POST /ghidra/batch - Batch export all .so files in directory to SQLite
+     * Body: {"directory": "/path/to/sos", "output": "/output/dir"}
+     */
+    private void handleGhidraBatch(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("POST")) {
+            sendError(exchange, 405, "Method not allowed");
+            return;
+        }
+
+        String body = new String(exchange.getRequestBody().readAllBytes());
+        Map<String, String> params = parseJson(body);
+
+        String dirPath = params.get("directory");
+        String outputPath = params.getOrDefault("output", OUTPUT_DIR + "/ghidra_export");
+
+        if (dirPath == null) {
+            sendError(exchange, 400, "Missing 'directory' parameter");
+            return;
+        }
+
+        File soDir = new File(dirPath);
+        if (!soDir.exists() || !soDir.isDirectory()) {
+            sendError(exchange, 404, "Directory not found: " + dirPath);
+            return;
+        }
+
+        File[] soFiles = soDir.listFiles((dir, name) -> name.endsWith(".so"));
+        if (soFiles == null || soFiles.length == 0) {
+            sendError(exchange, 400, "No .so files found in directory");
+            return;
+        }
+
+        File outputDir = new File(outputPath);
+        outputDir.mkdirs();
+
+        try {
+            String optionsJson = String.format("{\"directory\": \"%s\", \"output\": \"%s\", \"count\": %d}",
+                escape(dirPath), escape(outputPath), soFiles.length);
+            String jobId = globalDb.createJob("ghidra_batch_" + soFiles.length, optionsJson);
+
+            // Run batch export in background
+            analysisExecutor.submit(() -> runGhidraBatchExport(jobId, soFiles, outputDir));
+
+            String json = String.format("""
+                {
+                  "id": "%s",
+                  "status": "pending",
+                  "message": "Ghidra batch export started",
+                  "file_count": %d
+                }
+                """, jobId, soFiles.length);
+
+            sendJson(exchange, 202, json);
+
+        } catch (Exception e) {
+            sendError(exchange, 500, "Failed to create job: " + e.getMessage());
+        }
+    }
+
+    private void runGhidraExport(String jobId, File soFile, File outputDir) {
+        try {
+            globalDb.updateJobStatus(jobId, "running", 0, "Starting Ghidra headless analysis...");
+
+            String libName = soFile.getName().replace(".so", "");
+            File jsonFile = new File(outputDir, libName + ".json");
+            File dbFile = new File(outputDir, libName + ".db");
+            File projectDir = new File(outputDir, "ghidra_projects");
+            projectDir.mkdirs();
+
+            // Build analyzeHeadless command
+            List<String> cmd = new ArrayList<>();
+            cmd.add("/opt/ghidra/support/analyzeHeadless");
+            cmd.add(projectDir.getAbsolutePath());
+            cmd.add(libName + "_project");
+            cmd.add("-import");
+            cmd.add(soFile.getAbsolutePath());
+            cmd.add("-postScript");
+            cmd.add("ExportToJson.java");
+            cmd.add(outputDir.getAbsolutePath());
+            cmd.add("-scriptPath");
+            cmd.add("/workspace/scripts/ghidra");
+            cmd.add("-deleteProject");
+
+            globalDb.updateJobStatus(jobId, "running", 10, "Running Ghidra analysis on " + soFile.getName() + "...");
+
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+
+            // Read output
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    System.out.println("[Ghidra] " + line);
+
+                    // Update progress based on output
+                    if (line.contains("Exporting functions")) {
+                        globalDb.updateJobStatus(jobId, "running", 30, "Decompiling functions...");
+                    } else if (line.contains("Exporting strings")) {
+                        globalDb.updateJobStatus(jobId, "running", 70, "Exporting strings...");
+                    } else if (line.contains("[Export] Complete:")) {
+                        globalDb.updateJobStatus(jobId, "running", 85, line.substring(line.indexOf("[Export]") + 9));
+                    }
+                }
+            }
+
+            int exitCode = process.waitFor();
+
+            if (exitCode == 0 && jsonFile.exists()) {
+                globalDb.updateJobStatus(jobId, "running", 90, "Converting JSON to SQLite...");
+
+                // Convert JSON to SQLite
+                convertJsonToSqlite(jsonFile, dbFile);
+
+                globalDb.updateJobStatus(jobId, "completed", 100,
+                    String.format("Complete: %s exported to SQLite (%d bytes)", libName, dbFile.length()));
+            } else {
+                globalDb.updateJobStatus(jobId, "failed", 0,
+                    "Ghidra analysis failed with exit code " + exitCode);
+            }
+
+        } catch (Exception e) {
+            try {
+                globalDb.updateJobStatus(jobId, "failed", 0, "Error: " + e.getMessage());
+            } catch (Exception ignored) {}
+            e.printStackTrace();
+        }
+    }
+
+    private void convertJsonToSqlite(File jsonFile, File dbFile) throws Exception {
+        // Call Python script to convert JSON to SQLite
+        List<String> cmd = new ArrayList<>();
+        cmd.add("python3");
+        cmd.add("/workspace/scripts/json_to_sqlite.py");
+        cmd.add(jsonFile.getAbsolutePath());
+        cmd.add(dbFile.getAbsolutePath());
+
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                System.out.println("[JSON2SQL] " + line);
+            }
+        }
+
+        int exitCode = process.waitFor();
+        if (exitCode != 0) {
+            throw new Exception("JSON to SQLite conversion failed with exit code " + exitCode);
+        }
+    }
+
+    private void runGhidraBatchExport(String jobId, File[] soFiles, File outputDir) {
+        try {
+            int total = soFiles.length;
+            int completed = 0;
+            int failed = 0;
+
+            File projectDir = new File(outputDir, "ghidra_projects");
+            projectDir.mkdirs();
+
+            for (File soFile : soFiles) {
+                String libName = soFile.getName().replace(".so", "");
+                File jsonFile = new File(outputDir, libName + ".json");
+                File dbFile = new File(outputDir, libName + ".db");
+
+                // Skip if already exported and not empty
+                if (dbFile.exists() && dbFile.length() > 10000) {
+                    System.out.println("[GhidraBatch] Skipping " + libName + " (already exported)");
+                    completed++;
+                    continue;
+                }
+
+                int progress = (completed * 100) / total;
+                globalDb.updateJobStatus(jobId, "running", progress,
+                    String.format("[%d/%d] Analyzing %s...", completed + 1, total, libName));
+
+                try {
+                    System.out.println("[GhidraBatch] Analyzing: " + soFile.getName());
+
+                    // Step 1: Run Ghidra headless with ExportToJson.java
+                    List<String> cmd = new ArrayList<>();
+                    cmd.add("/opt/ghidra/support/analyzeHeadless");
+                    cmd.add(projectDir.getAbsolutePath());
+                    cmd.add(libName + "_project");
+                    cmd.add("-import");
+                    cmd.add(soFile.getAbsolutePath());
+                    cmd.add("-postScript");
+                    cmd.add("ExportToJson.java");
+                    cmd.add(outputDir.getAbsolutePath());
+                    cmd.add("-scriptPath");
+                    cmd.add("/workspace/scripts/ghidra");
+                    cmd.add("-deleteProject");
+
+                    ProcessBuilder pb = new ProcessBuilder(cmd);
+                    pb.redirectErrorStream(true);
+                    Process process = pb.start();
+
+                    // Read output
+                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            if (line.contains("[Export]") || line.contains("ERROR") || line.contains("functions")) {
+                                System.out.println("[Ghidra] " + line);
+                            }
+                        }
+                    }
+
+                    int exitCode = process.waitFor();
+
+                    if (exitCode == 0 && jsonFile.exists() && jsonFile.length() > 1000) {
+                        // Step 2: Convert JSON to SQLite
+                        System.out.println("[GhidraBatch] Converting JSON to SQLite: " + libName);
+                        convertJsonToSqlite(jsonFile, dbFile);
+
+                        if (dbFile.exists() && dbFile.length() > 1000) {
+                            System.out.println("[GhidraBatch] " + libName + ": exported (" + dbFile.length() + " bytes)");
+                            completed++;
+                            // Optionally delete the JSON file to save space
+                            // jsonFile.delete();
+                        } else {
+                            System.err.println("[GhidraBatch] Failed to convert: " + libName);
+                            failed++;
+                        }
+                    } else {
+                        System.err.println("[GhidraBatch] Ghidra failed: " + libName + " (exit code: " + exitCode + ")");
+                        failed++;
+                    }
+
+                } catch (Exception e) {
+                    System.err.println("[GhidraBatch] Error: " + soFile.getName() + " - " + e.getMessage());
+                    failed++;
+                }
+            }
+
+            globalDb.updateJobStatus(jobId, "completed", 100,
+                String.format("Batch complete: %d/%d exported, %d failed. Output: %s",
+                    completed, total, failed, outputDir.getAbsolutePath()));
+
+        } catch (Exception e) {
+            try {
+                globalDb.updateJobStatus(jobId, "failed", 0, "Error: " + e.getMessage());
+            } catch (Exception ignored) {}
+            e.printStackTrace();
         }
     }
 

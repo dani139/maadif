@@ -21,6 +21,7 @@ import java.io.PrintWriter;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.sql.*;
 import java.util.*;
 
 /**
@@ -372,7 +373,7 @@ public class GhidraAnalyzer {
             writer.println("=".repeat(80));
             writer.println("File: " + result.fileName);
             writer.println("Size: " + formatSize(result.fileSize));
-            writer.println("Analysis Date: " + new Date());
+            writer.println("Analysis Date: " + new java.util.Date());
             writer.println();
 
             if (result.programName != null) {
@@ -899,6 +900,342 @@ public class GhidraAnalyzer {
                 .replace("\n", "\\n")
                 .replace("\r", "\\r")
                 .replace("\t", "\\t");
+    }
+
+    // =========================================================================
+    // SQLite Export
+    // =========================================================================
+
+    /**
+     * Export analysis results to SQLite database with full decompilation.
+     * Creates a comprehensive database with all analysis data.
+     * @param result The analysis result to export
+     * @param dbPath Path for the SQLite database
+     * @return Number of functions exported
+     */
+    public int saveToSqlite(AnalysisResult result, File dbPath) throws Exception {
+        System.out.println("[Ghidra] Exporting to SQLite: " + dbPath.getAbsolutePath());
+
+        // Delete existing database
+        if (dbPath.exists()) {
+            dbPath.delete();
+        }
+
+        dbPath.getParentFile().mkdirs();
+
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbPath.getAbsolutePath())) {
+            conn.setAutoCommit(false);
+
+            // Create tables
+            try (Statement stmt = conn.createStatement()) {
+                stmt.executeUpdate("""
+                    CREATE TABLE library_info (
+                        id INTEGER PRIMARY KEY,
+                        name TEXT,
+                        file_size INTEGER,
+                        architecture TEXT,
+                        compiler TEXT,
+                        image_base TEXT,
+                        language TEXT,
+                        analysis_date TEXT,
+                        function_count INTEGER,
+                        string_count INTEGER,
+                        import_count INTEGER,
+                        export_count INTEGER
+                    )
+                """);
+
+                stmt.executeUpdate("""
+                    CREATE TABLE functions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT,
+                        address TEXT UNIQUE,
+                        signature TEXT,
+                        calling_convention TEXT,
+                        parameter_count INTEGER,
+                        body_size INTEGER,
+                        is_thunk INTEGER,
+                        is_external INTEGER,
+                        is_export INTEGER,
+                        instruction_count INTEGER,
+                        basic_block_count INTEGER,
+                        edge_count INTEGER,
+                        cyclomatic_complexity INTEGER,
+                        callee_count INTEGER,
+                        external_call_count INTEGER,
+                        mnemonic_hash TEXT,
+                        import_call_hash TEXT,
+                        string_refs_hash TEXT,
+                        cfg_hash TEXT,
+                        prime_product TEXT,
+                        kgh_hash TEXT,
+                        decompiled TEXT
+                    )
+                """);
+
+                stmt.executeUpdate("""
+                    CREATE TABLE strings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        value TEXT,
+                        length INTEGER
+                    )
+                """);
+
+                stmt.executeUpdate("""
+                    CREATE TABLE imports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT
+                    )
+                """);
+
+                stmt.executeUpdate("""
+                    CREATE TABLE exports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT
+                    )
+                """);
+
+                stmt.executeUpdate("""
+                    CREATE TABLE memory_sections (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT,
+                        start_addr TEXT,
+                        end_addr TEXT,
+                        size INTEGER,
+                        is_read INTEGER,
+                        is_write INTEGER,
+                        is_execute INTEGER,
+                        is_initialized INTEGER
+                    )
+                """);
+
+                stmt.executeUpdate("""
+                    CREATE TABLE function_calls (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        caller_address TEXT,
+                        callee_name TEXT
+                    )
+                """);
+
+                stmt.executeUpdate("""
+                    CREATE TABLE function_import_calls (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        function_address TEXT,
+                        import_name TEXT
+                    )
+                """);
+
+                stmt.executeUpdate("""
+                    CREATE TABLE function_string_refs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        function_address TEXT,
+                        string_value TEXT
+                    )
+                """);
+
+                stmt.executeUpdate("""
+                    CREATE TABLE structures (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT,
+                        size INTEGER,
+                        field_count INTEGER
+                    )
+                """);
+
+                // Create indexes
+                stmt.executeUpdate("CREATE INDEX idx_functions_name ON functions(name)");
+                stmt.executeUpdate("CREATE INDEX idx_functions_address ON functions(address)");
+                stmt.executeUpdate("CREATE INDEX idx_functions_mnemonic_hash ON functions(mnemonic_hash)");
+                stmt.executeUpdate("CREATE INDEX idx_functions_cfg_hash ON functions(cfg_hash)");
+                stmt.executeUpdate("CREATE INDEX idx_strings_value ON strings(value)");
+                stmt.executeUpdate("CREATE INDEX idx_imports_name ON imports(name)");
+                stmt.executeUpdate("CREATE INDEX idx_exports_name ON exports(name)");
+                stmt.executeUpdate("CREATE INDEX idx_function_calls_caller ON function_calls(caller_address)");
+                stmt.executeUpdate("CREATE INDEX idx_function_import_calls ON function_import_calls(function_address)");
+                stmt.executeUpdate("CREATE INDEX idx_function_string_refs ON function_string_refs(function_address)");
+            }
+
+            // Insert library info
+            try (PreparedStatement ps = conn.prepareStatement("""
+                INSERT INTO library_info (name, file_size, architecture, compiler, image_base, language,
+                                          analysis_date, function_count, string_count, import_count, export_count)
+                VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?)
+            """)) {
+                ps.setString(1, result.fileName);
+                ps.setLong(2, result.fileSize);
+                ps.setString(3, result.languageId);
+                ps.setString(4, result.compilerSpec);
+                ps.setString(5, result.imageBase);
+                ps.setString(6, result.languageId);
+                ps.setInt(7, result.functions.size());
+                ps.setInt(8, result.strings.size());
+                ps.setInt(9, result.imports.size());
+                ps.setInt(10, result.exports.size());
+                ps.executeUpdate();
+            }
+
+            // Insert functions
+            int funcCount = 0;
+            try (PreparedStatement ps = conn.prepareStatement("""
+                INSERT INTO functions (name, address, signature, calling_convention, parameter_count, body_size,
+                                       is_thunk, is_external, is_export, instruction_count, basic_block_count,
+                                       edge_count, cyclomatic_complexity, callee_count, external_call_count,
+                                       mnemonic_hash, import_call_hash, string_refs_hash, cfg_hash,
+                                       prime_product, kgh_hash, decompiled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """)) {
+                for (FunctionInfo func : result.functions) {
+                    ps.setString(1, func.name);
+                    ps.setString(2, func.address);
+                    ps.setString(3, func.signature);
+                    ps.setString(4, func.callingConvention);
+                    ps.setInt(5, func.parameterCount);
+                    ps.setLong(6, func.bodySize);
+                    ps.setInt(7, func.isThunk ? 1 : 0);
+                    ps.setInt(8, func.isExternal ? 1 : 0);
+                    ps.setInt(9, func.isExport ? 1 : 0);
+                    ps.setInt(10, func.instructionCount);
+                    ps.setInt(11, func.basicBlockCount);
+                    ps.setInt(12, func.edgeCount);
+                    ps.setInt(13, func.cyclomaticComplexity);
+                    ps.setInt(14, func.calleeCount);
+                    ps.setInt(15, func.externalCallCount);
+                    ps.setString(16, func.mnemonicHash);
+                    ps.setString(17, func.importCallHash);
+                    ps.setString(18, func.stringRefsHash);
+                    ps.setString(19, func.cfgHash);
+                    ps.setString(20, func.primeProduct);
+                    ps.setString(21, func.kghHash);
+                    ps.setString(22, func.decompiledCode);
+                    ps.executeUpdate();
+                    funcCount++;
+                }
+            }
+
+            // Insert function calls
+            try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO function_calls (caller_address, callee_name) VALUES (?, ?)")) {
+                for (FunctionInfo func : result.functions) {
+                    for (String callee : func.calledFunctions) {
+                        ps.setString(1, func.address);
+                        ps.setString(2, callee);
+                        ps.executeUpdate();
+                    }
+                }
+            }
+
+            // Insert import calls per function
+            try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO function_import_calls (function_address, import_name) VALUES (?, ?)")) {
+                for (FunctionInfo func : result.functions) {
+                    for (String imp : func.importCalls) {
+                        ps.setString(1, func.address);
+                        ps.setString(2, imp);
+                        ps.executeUpdate();
+                    }
+                }
+            }
+
+            // Insert string refs per function
+            try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO function_string_refs (function_address, string_value) VALUES (?, ?)")) {
+                for (FunctionInfo func : result.functions) {
+                    for (String str : func.stringRefs) {
+                        ps.setString(1, func.address);
+                        ps.setString(2, str);
+                        ps.executeUpdate();
+                    }
+                }
+            }
+
+            // Insert strings
+            try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO strings (value, length) VALUES (?, ?)")) {
+                for (String str : result.strings) {
+                    ps.setString(1, str);
+                    ps.setInt(2, str.length());
+                    ps.executeUpdate();
+                }
+            }
+
+            // Insert imports
+            try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO imports (name) VALUES (?)")) {
+                for (String imp : result.imports) {
+                    ps.setString(1, imp);
+                    ps.executeUpdate();
+                }
+            }
+
+            // Insert exports
+            try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO exports (name) VALUES (?)")) {
+                for (String exp : result.exports) {
+                    ps.setString(1, exp);
+                    ps.executeUpdate();
+                }
+            }
+
+            // Insert memory sections
+            try (PreparedStatement ps = conn.prepareStatement("""
+                INSERT INTO memory_sections (name, start_addr, end_addr, size, is_read, is_write, is_execute, is_initialized)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """)) {
+                for (MemorySection sec : result.memorySections) {
+                    ps.setString(1, sec.name);
+                    ps.setString(2, sec.start);
+                    ps.setString(3, sec.end);
+                    ps.setLong(4, sec.size);
+                    ps.setInt(5, sec.isRead ? 1 : 0);
+                    ps.setInt(6, sec.isWrite ? 1 : 0);
+                    ps.setInt(7, sec.isExecute ? 1 : 0);
+                    ps.setInt(8, sec.isInitialized ? 1 : 0);
+                    ps.executeUpdate();
+                }
+            }
+
+            // Insert structures
+            try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO structures (name, size, field_count) VALUES (?, ?, ?)")) {
+                for (StructureInfo struct : result.structures) {
+                    ps.setString(1, struct.name);
+                    ps.setInt(2, struct.size);
+                    ps.setInt(3, struct.fieldCount);
+                    ps.executeUpdate();
+                }
+            }
+
+            conn.commit();
+
+            System.out.println("[Ghidra] SQLite export complete: " + funcCount + " functions, " +
+                             result.strings.size() + " strings, " + dbPath.length() + " bytes");
+            return funcCount;
+        }
+    }
+
+    /**
+     * Full analysis pipeline: analyze binary with decompilation and export to SQLite.
+     * @param binaryFile The .so file to analyze
+     * @param outputDir Directory for SQLite output
+     * @return Path to the created SQLite database
+     */
+    public File analyzeAndExport(File binaryFile, File outputDir) throws Exception {
+        // Run analysis with decompilation
+        AnalysisResult result = analyzeFile(binaryFile, true);
+
+        if (!result.success) {
+            throw new Exception("Analysis failed: " + String.join(", ", result.errors));
+        }
+
+        // Create SQLite database
+        String libName = binaryFile.getName().replace(".so", "");
+        File dbFile = new File(outputDir, libName + ".db");
+        saveToSqlite(result, dbFile);
+
+        // Save decompiled functions to files
+        saveDecompiledFunctions(result, outputDir, libName);
+
+        return dbFile;
     }
 
     // Data classes for analysis results
